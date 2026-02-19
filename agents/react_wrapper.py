@@ -1,249 +1,373 @@
 """
-AutoGen ConversableAgent + ReAct 封装
-内层 ReAct：Thought → Action → Observation 循环
+AutoGen GroupChat 多智能体协作封装
+研究员、分析师、验证员在同一对话中交互，实时交叉验证。
+GroupChatManager 作为协调者自动选择下一位发言者。
 """
 
 import re
 import logging
-from typing import Optional, Tuple
-from autogen import ConversableAgent
-from config.settings import get_autogen_llm_config, MAX_AGENT_STEPS
+import difflib
+from typing import Optional, Annotated
+from autogen import ConversableAgent, GroupChat, GroupChatManager
+from config.settings import get_autogen_llm_config, MAX_GROUP_CHAT_ROUNDS
 from tools.bocha_search import BochaSearchTool
+from tools.serper_search import SerperSearchTool
 from tools.code_executor import get_code_executor
+from agents.prompts import (
+    RESEARCH_SYSTEM_PROMPT,
+    ANALYSIS_SYSTEM_PROMPT,
+    VERIFICATION_SYSTEM_PROMPT,
+)
 
 logger = logging.getLogger(__name__)
 
 # 全局搜索工具实例（避免重复创建）
-_search_tool: BochaSearchTool | None = None
+_bocha_tool: BochaSearchTool | None = None
+_serper_tool: SerperSearchTool | None = None
 
 
-def _get_search_tool() -> BochaSearchTool:
-    global _search_tool
-    if _search_tool is None:
-        _search_tool = BochaSearchTool()
-    return _search_tool
+def _get_bocha_tool() -> BochaSearchTool:
+    global _bocha_tool
+    if _bocha_tool is None:
+        _bocha_tool = BochaSearchTool()
+    return _bocha_tool
 
 
-class ReactSubAgent:
+def _get_serper_tool() -> SerperSearchTool:
+    global _serper_tool
+    if _serper_tool is None:
+        _serper_tool = SerperSearchTool()
+    return _serper_tool
+
+
+def _normalize_query(query: str) -> str:
+    """归一化查询用于去重比较：小写、去引号、去多余空格。"""
+    q = query.lower().strip()
+    q = q.replace('"', '').replace("'", '')
+    q = re.sub(r'\s+', ' ', q)
+    return q
+
+
+def _is_duplicate_query(query: str, cache: dict, threshold: float = 0.85) -> Optional[str]:
     """
-    使用 AutoGen ConversableAgent 实现的 ReAct 子代理。
+    检查查询是否与缓存中的某个查询重复（精确匹配或模糊匹配）。
+    返回匹配到的缓存 key，或 None。
+    """
+    norm = _normalize_query(query)
+    if norm in cache:
+        return norm
+    for cached_norm in cache:
+        ratio = difflib.SequenceMatcher(None, norm, cached_norm).ratio()
+        if ratio >= threshold:
+            return cached_norm
+    return None
 
-    通过手动驱动 Thought-Action-Observation 循环，
-    确保每一步的推理过程显式、可观测。
+
+class GroupChatOrchestrator:
+    """
+    使用 AutoGen GroupChat 实现的多智能体协作系统。
+
+    架构：
+    - user_proxy（无 LLM）：发起对话 + 执行工具调用
+    - researcher（LLM）：广度搜索，收集关键线索
+    - analyst（LLM）：深度分析，建立逻辑链
+    - verifier（LLM）：事实核查，交叉验证
+    - GroupChatManager（LLM）：自动选择下一位发言者
+
+    所有代理共享同一对话，可实时质疑、补充、修正彼此的发现。
     """
 
-    MAX_OBS_CHARS = 6000  # 每次 Observation 传回给模型的最大字符数
+    MAX_OBS_CHARS = 6000
+    DEDUP_SIMILARITY_THRESHOLD = 0.85
 
-    def __init__(
-        self,
-        name: str,
-        system_prompt: str,
-        max_steps: int = MAX_AGENT_STEPS,
-    ):
-        self.name = name
-        self.max_steps = max_steps
-        self.search_tool = _get_search_tool()
+    def __init__(self, max_rounds: int = MAX_GROUP_CHAT_ROUNDS):
+        self.max_rounds = max_rounds
+        self._search_cache: dict[str, str] = {}
+        self.bocha_tool = _get_bocha_tool()
+        self.serper_tool = _get_serper_tool()
 
-        self.agent = ConversableAgent(
-            name=name,
-            system_message=system_prompt,
-            llm_config=get_autogen_llm_config(),
+        llm_config = get_autogen_llm_config()
+
+        # ---- user_proxy: 无 LLM，发起对话 + 执行工具 ----
+        self.user_proxy = ConversableAgent(
+            name="user_proxy",
             human_input_mode="NEVER",
-            is_termination_msg=lambda _: False,
+            llm_config=False,
+            is_termination_msg=lambda msg: (
+                msg.get("content") is not None
+                and "TERMINATE" in msg.get("content", "")
+            ),
+            default_auto_reply="请继续讨论。",
+            max_consecutive_auto_reply=1,
         )
+
+        # ---- researcher: 广度搜索（CoT）----
+        self.researcher = ConversableAgent(
+            name="researcher",
+            system_message=RESEARCH_SYSTEM_PROMPT,
+            llm_config=llm_config,
+            human_input_mode="NEVER",
+        )
+
+        # ---- analyst: 深度分析（ToT）----
+        self.analyst = ConversableAgent(
+            name="analyst",
+            system_message=ANALYSIS_SYSTEM_PROMPT,
+            llm_config=llm_config,
+            human_input_mode="NEVER",
+        )
+
+        # ---- verifier: 事实核查（CoT）----
+        self.verifier = ConversableAgent(
+            name="verifier",
+            system_message=VERIFICATION_SYSTEM_PROMPT,
+            llm_config=llm_config,
+            human_input_mode="NEVER",
+        )
+
+        # ---- 注册工具到所有 LLM 代理 ----
+        self._register_tools()
+
+        # ---- GroupChat: 所有代理在同一对话中交互 ----
+        self.groupchat = GroupChat(
+            agents=[self.user_proxy, self.researcher, self.analyst, self.verifier],
+            messages=[],
+            max_round=self.max_rounds,
+            speaker_selection_method="auto",
+            allow_repeat_speaker=False,
+        )
+
+        # ---- GroupChatManager: 协调者（自动选择发言者）----
+        self.manager = GroupChatManager(
+            groupchat=self.groupchat,
+            llm_config=llm_config,
+            is_termination_msg=lambda msg: (
+                msg.get("content") is not None
+                and "TERMINATE" in msg.get("content", "")
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    # 工具注册
+    # ------------------------------------------------------------------
+    def _register_tools(self):
+        """将工具注册到所有 LLM 代理（LLM 端）和 user_proxy（执行端）。"""
+        llm_agents = [self.researcher, self.analyst, self.verifier]
+
+        # ---- search_google ----
+        def search_google(
+            query: Annotated[str, "Search query, preferably in English. Google operators like \"exact\" and site: are supported."],
+        ) -> str:
+            return self._execute_search("google", query)
+
+        # ---- search_bocha ----
+        def search_bocha(
+            query: Annotated[str, "Natural language search query, preferably in Chinese. No search operators."],
+        ) -> str:
+            return self._execute_search("bocha", query)
+
+        # ---- run_code ----
+        def run_code(
+            code: Annotated[str, "Python code to execute. Must use print() to output results."],
+        ) -> str:
+            return self._execute_code(code)
+
+        # 在 user_proxy 上注册执行
+        self.user_proxy.register_for_execution(name="search_google")(search_google)
+        self.user_proxy.register_for_execution(name="search_bocha")(search_bocha)
+        self.user_proxy.register_for_execution(name="run_code")(run_code)
+
+        # 在每个 LLM 代理上注册 LLM 端
+        for agent in llm_agents:
+            agent.register_for_llm(
+                name="search_google",
+                description=(
+                    "Google search engine for international/overseas content. "
+                    "Supports Google advanced operators: \"exact match\", site:, intitle:, etc. "
+                    "Use English queries for best results. "
+                    "Use for: foreign people, English papers, international organizations, "
+                    "overseas events, foreign companies."
+                ),
+            )(search_google)
+
+            agent.register_for_llm(
+                name="search_bocha",
+                description=(
+                    "Bocha search engine for Chinese domestic content. "
+                    "Only supports natural language queries, NO advanced syntax. "
+                    "Use Chinese queries for best results. "
+                    "Use for: Chinese people, Chinese papers, domestic organizations, "
+                    "events in China, Chinese companies."
+                ),
+            )(search_bocha)
+
+            agent.register_for_llm(
+                name="run_code",
+                description=(
+                    "Execute Python code for math calculations, date arithmetic, "
+                    "unit conversions, string processing, etc. "
+                    "Use print() to output results. "
+                    "Available: math, re, json, datetime, statistics, decimal, "
+                    "fractions, collections."
+                ),
+            )(run_code)
+
+    # ------------------------------------------------------------------
+    # 工具执行（内部）
+    # ------------------------------------------------------------------
+    def _execute_search(self, engine: str, query: str) -> str:
+        """执行搜索，包含去重检查和结果截断。"""
+        dup_key = _is_duplicate_query(
+            query, self._search_cache, self.DEDUP_SIMILARITY_THRESHOLD
+        )
+        if dup_key is not None:
+            print(f"  │ [GroupChat] {engine} [DEDUP] → {query[:80]}")
+            cached = self._search_cache[dup_key]
+            return (
+                f"[DUPLICATE] This query is too similar to a previous search. "
+                f"Cached result:\n{cached[:2000]}\n"
+                f"Please try a completely different search angle."
+            )
+
+        print(f"  │ [GroupChat] {engine} → {query[:100]}")
+
+        if engine == "google":
+            result = self.serper_tool.execute(query)
+        else:
+            result = self.bocha_tool.execute(query)
+
+        norm_key = _normalize_query(query)
+        self._search_cache[norm_key] = result
+
+        if len(result) > self.MAX_OBS_CHARS:
+            result = result[: self.MAX_OBS_CHARS] + f"\n...[已截断，原始 {len(result)} 字符]"
+
+        return result
+
+    def _execute_code(self, code: str) -> str:
+        """执行 Python 代码。"""
+        print(f"  │ [GroupChat] code execution")
+        executor = get_code_executor()
+        result = executor.execute(code)
+        if len(result) > self.MAX_OBS_CHARS:
+            result = result[: self.MAX_OBS_CHARS]
+        print(f"  │ output: {result[:200]}")
+        return result
 
     # ------------------------------------------------------------------
     # 公开接口
     # ------------------------------------------------------------------
-    def run(self, task: str, context: str = "") -> str:
+    def run(self, question: str, sub_questions: list, context: str = "") -> str:
         """
-        执行 ReAct 循环并返回最终结果。
+        执行 GroupChat 多智能体协作。
+
+        所有代理在同一对话中交互：
+        researcher 搜索 → analyst 即时分析 → verifier 即时验证 → 交叉修正
 
         Args:
-            task:    子任务描述
-            context: 上下文信息（已有证据等）
+            question:      原始问题
+            sub_questions:  拆分后的子问题列表
+            context:       已有上下文信息
 
         Returns:
-            子代理的最终回答
+            群组讨论的综合结论
         """
-        initial_prompt = self._build_initial_prompt(task, context)
-        conversation = [{"role": "user", "content": initial_prompt}]
+        # 重置搜索缓存和 GroupChat 消息
+        self._search_cache = {}
+        self.groupchat.messages.clear()
 
-        print(f"\n{'─'*60}")
-        print(f"  ▶ 子代理 [{self.name}] 启动")
-        print(f"    任务: {task[:80]}...")
-        print(f"{'─'*60}")
+        prompt = self._build_task_prompt(question, sub_questions, context)
 
-        for step in range(1, self.max_steps + 1):
-            # ---- Agent 思考 ----
-            try:
-                response = self.agent.generate_reply(messages=conversation)
-            except Exception as e:
-                logger.error(f"[{self.name}] LLM 调用失败: {e}")
-                conversation = self._trim_conversation(conversation)
-                continue
+        print(f"\n{'═'*70}")
+        print(f"  ▶ GroupChat 多智能体协作启动")
+        print(f"    参与者: researcher, analyst, verifier")
+        print(f"    最大轮次: {self.max_rounds}")
+        print(f"    问题: {question[:80]}...")
+        print(f"{'═'*70}")
 
-            if response is None:
-                logger.warning(f"[{self.name}] 空回复，跳过")
-                continue
+        try:
+            chat_result = self.user_proxy.initiate_chat(
+                self.manager,
+                message=prompt,
+            )
+            result = self._extract_result(chat_result)
+        except Exception as e:
+            logger.error(f"[GroupChat] 执行失败: {e}", exc_info=True)
+            result = f"GroupChat 执行失败: {e}"
 
-            if isinstance(response, dict):
-                response = response.get("content", str(response))
+        print(f"\n  ╔═ GroupChat 最终结论")
+        print(f"  ║ {result[:300]}")
+        print(f"  ╚═")
+        print(f"{'═'*70}")
 
-            conversation.append({"role": "assistant", "content": response})
-
-            # ---- 检查 Final Answer ----
-            final = self._extract_final_answer(response)
-            if final:
-                self._print_final(step, final)
-                return final
-
-            # ---- 解析 Action 并执行 ----
-            action_type, action_input = self._parse_action(response)
-            thought = self._extract_thought(response)
-
-            if action_type == "search" and action_input:
-                self._print_step(step, thought, f"search → {action_input[:100]}")
-                observation = self.search_tool.execute(action_input)
-                obs_truncated = observation[: self.MAX_OBS_CHARS]
-                if len(observation) > self.MAX_OBS_CHARS:
-                    obs_truncated += f"\n...[已截断，原始 {len(observation)} 字符]"
-
-                conversation.append({
-                    "role": "user",
-                    "content": f"Observation:\n{obs_truncated}\n\n请继续你的推理。",
-                })
-
-            elif action_type == "code" and action_input:
-                self._print_step(step, thought, f"code → {action_input[:100]}")
-                executor = get_code_executor()
-                code_result = executor.execute(action_input)
-                obs_truncated = code_result[: self.MAX_OBS_CHARS]
-                print(f"  | Code Output: {obs_truncated[:200]}")
-
-                conversation.append({
-                    "role": "user",
-                    "content": f"Observation (code output):\n{obs_truncated}\n\n请根据计算结果继续推理。",
-                })
-
-            else:
-                # 没有解析到 Action，提示模型继续
-                self._print_step(step, thought, "(无有效 Action)")
-                conversation.append({
-                    "role": "user",
-                    "content": (
-                        "未检测到有效的 Action。请严格按照格式输出：\n"
-                        "Thought: ...\nAction: search\nAction Input: <查询>\n"
-                        "或 Action: code\nAction Input:\n```python\n<代码>\n```\n"
-                        "或者输出 Final Answer: <最终结论>"
-                    ),
-                })
-
-        # ---- 超过最大步数，强制总结 ----
-        return self._force_conclusion(task, conversation)
+        return result
 
     # ------------------------------------------------------------------
     # 内部方法
     # ------------------------------------------------------------------
-    def _build_initial_prompt(self, task: str, context: str) -> str:
-        parts = [f"请完成以下任务：\n{task}"]
+    def _build_task_prompt(
+        self, question: str, sub_questions: list, context: str
+    ) -> str:
+        parts = [
+            f"# 原始问题\n{question}\n",
+        ]
+
+        if sub_questions:
+            parts.append("# 拆分的子问题")
+            for i, sq in enumerate(sub_questions, 1):
+                content = sq.get("content", sq) if isinstance(sq, dict) else str(sq)
+                parts.append(f"  {i}. {content}")
+            parts.append("")
+
         if context:
-            parts.append(f"\n已有上下文信息：\n{context}")
-        parts.append("\n请按照你的思维框架开始推理。输出 Thought: 开始。")
+            parts.append(f"# 已有上下文\n{context}\n")
+
+        parts.append(
+            "# 任务要求\n"
+            "请三位专家（researcher、analyst、verifier）协作完成以上问题。\n"
+            "- researcher 负责搜索关键事实和线索\n"
+            "- analyst 负责建立逻辑关系和推理链\n"
+            "- verifier 负责验证关键声明的准确性\n"
+            "\n"
+            "请积极互动：质疑不确定的信息、补充遗漏的线索、修正错误的结论。\n"
+            "当团队对答案达成共识后，由最后发言者输出最终结论并在末尾加上 TERMINATE。"
+        )
         return "\n".join(parts)
 
-    @staticmethod
-    def _extract_thought(text: str) -> str:
-        m = re.search(r"Thought:\s*(.+?)(?=Action:|Final Answer:|$)", text, re.DOTALL)
-        return m.group(1).strip() if m else text[:200]
+    def _extract_result(self, chat_result) -> str:
+        """从 GroupChat 结果中提取最终结论。"""
+        # 优先使用 summary
+        if chat_result.summary:
+            summary = chat_result.summary.replace("TERMINATE", "").strip()
+            if summary:
+                return summary
 
-    @staticmethod
-    def _parse_action(text: str) -> Tuple[Optional[str], Optional[str]]:
-        """
-        解析 Action 类型和内容。
-        返回 (action_type, action_input)，其中 action_type 为 'search' 或 'code'。
-        """
-        # 先检测 Action 类型
-        action_match = re.search(r"Action:\s*(search|code)\b", text, re.IGNORECASE)
-        if not action_match:
-            # 兼容旧格式：没有明确 Action 类型但有 Action Input
-            m = re.search(r"Action Input:\s*(.+?)(?=\n\n|Thought:|$)", text, re.DOTALL)
-            if m:
-                content = m.group(1).strip()
-                # 根据内容推断类型：包含代码块标记则为 code
-                if "```python" in content or "```py" in content:
-                    code = re.sub(r"```(?:python|py)?\s*", "", content)
-                    code = code.replace("```", "").strip()
-                    return "code", code
-                return "search", content
-            return None, None
+        # 回退：遍历 chat_history 找最后一条有实质内容的代理消息
+        for msg in reversed(chat_result.chat_history):
+            content = msg.get("content", "")
+            if not content:
+                continue
+            if msg.get("role") == "tool":
+                continue
+            name = msg.get("name", "")
+            if name == "user_proxy":
+                continue
+            content = content.replace("TERMINATE", "").strip()
+            if content:
+                return content
 
-        action_type = action_match.group(1).lower()
+        return "未能得出结论"
 
-        # 提取 Action Input
-        after_action = text[action_match.end():]
-        m = re.search(r"Action Input:\s*(.+?)(?=\nThought:|\nAction:|\nFinal Answer:|$)", after_action, re.DOTALL)
-        if not m:
-            return action_type, None
-
-        content = m.group(1).strip()
-
-        # 如果是 code 类型，去掉 markdown 代码块标记
-        if action_type == "code":
-            content = re.sub(r"```(?:python|py)?\s*", "", content)
-            content = content.replace("```", "").strip()
-
-        return action_type, content if content else None
-
-    @staticmethod
-    def _extract_final_answer(text: str) -> Optional[str]:
-        m = re.search(r"Final Answer:\s*(.+?)$", text, re.DOTALL)
-        return m.group(1).strip() if m else None
-
-    def _force_conclusion(self, task: str, conversation: list) -> str:
-        """达到最大步数后，强制模型给出结论。"""
-        conversation.append({
-            "role": "user",
-            "content": (
-                "你已达到最大推理步数。请根据目前收集到的所有信息，"
-                "立即给出最终结论。\n"
-                "Final Answer:"
-            ),
-        })
-        try:
-            response = self.agent.generate_reply(messages=conversation)
-            if isinstance(response, dict):
-                response = response.get("content", str(response))
-            final = self._extract_final_answer(response) if response else None
-            result = final or (response.strip() if response else "未能得出结论")
-        except Exception as e:
-            logger.error(f"[{self.name}] 强制总结失败: {e}")
-            result = "推理过程未能得出明确结论"
-
-        print(f"  ⚠ [{self.name}] 达到最大步数，强制结束")
-        print(f"  ✔ 结论: {result[:120]}...")
-        return result
-
-    def _trim_conversation(self, conversation: list) -> list:
-        """上下文过长时裁剪中间轮次。"""
-        if len(conversation) <= 3:
-            return conversation
-        keep = max(1, len(conversation) // 2)
-        trimmed = [conversation[0]] + conversation[-keep:]
-        logger.info(f"[{self.name}] 裁剪会话: {len(conversation)} -> {len(trimmed)}")
-        return trimmed
-
-    # ------------------------------------------------------------------
-    # 打印
-    # ------------------------------------------------------------------
-    def _print_step(self, step: int, thought: str, action_input: str):
-        print(f"\n  ┌─ [{self.name}] Step {step}")
-        print(f"  │ Thought : {thought[:150]}")
-        print(f"  │ Action  : {action_input[:120]}")
-        print(f"  └─")
-
-    def _print_final(self, step: int, answer: str):
-        print(f"\n  ┌─ [{self.name}] Step {step} ── Final Answer")
-        print(f"  │ {answer[:200]}")
-        print(f"  └─")
-        print(f"{'─'*60}")
+    def extract_evidence_from_history(self) -> list:
+        """从 GroupChat 历史中提取证据列表，供 LangGraph 状态使用。"""
+        evidence = []
+        for msg in self.groupchat.messages:
+            name = msg.get("name", "")
+            content = msg.get("content", "")
+            if not content or name == "user_proxy" or msg.get("role") == "tool":
+                continue
+            evidence.append({
+                "source": name,
+                "content": content.replace("TERMINATE", "").strip()[:500],
+            })
+        return evidence

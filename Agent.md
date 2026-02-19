@@ -105,8 +105,121 @@ dataAgent/
 | 2026-02-19 00:47 | `tools/code_executor.py` | 新建 | 安全代码沙箱：AST 白名单 + 受限 builtins + stdout 捕获 + 线程超时 |
 | 2026-02-19 00:47 | `agents/react_wrapper.py` | 修改 | `_parse_action()` 支持 `Action: code`；run() 循环新增 code 分支调用 CodeExecutor |
 | 2026-02-19 00:47 | `agents/prompts.py` | 修改 | 三个子代理提示词均加入 `Action: code` 工具说明和使用场景 |
+| 2026-02-19 21:00 | `tools/serper_search.py` | 新建 | Serper Google Search API 封装，用于英文查询 |
+| 2026-02-19 21:00 | `config/settings.py` | 修改 | 新增 `SERPER_API_KEY` / `SERPER_BASE_URL` / `SERPER_DEFAULT_COUNT` 配置 |
+| 2026-02-19 21:00 | `agents/react_wrapper.py` | 修改 | 双搜索引擎语言路由 + 搜索去重（精确+模糊） + LLM 连续失败熔断 |
+| 2026-02-19 21:00 | `agents/prompts.py` | 修改 | 三个子代理 prompt 均加入搜索工具注意事项（禁用 Google 语法、语言路由提示） |
+| 2026-02-19 21:00 | `graph/nodes.py` | 修改 | `synthesize` prompt 强化纯答案输出规则；`format_answer` 改用 LLM 提取+规则后处理两层架构 |
+| 2026-02-19 21:10 | `agents/react_wrapper.py` | 修改 | 搜索引擎选择从语言检测改为模型驱动：`search_google` / `search_bocha` 双 Action |
+| 2026-02-19 21:10 | `agents/prompts.py` | 修改 | 三个 prompt 的 Action 格式改为 `search_google` / `search_bocha`，引导模型按内容地域相关性选择引擎 |
+| 2026-02-19 22:07 | `agents/react_wrapper.py` | 重写 | 从文本 ReAct 解析改为 AutoGen function calling（assistant + executor 双代理 + initiate_chat） |
+| 2026-02-19 22:07 | `agents/prompts.py` | 重写 | 移除手动 Action/Observation 格式，适配 function calling；允许 search_google 使用 Google 高级语法 |
+| 2026-02-19 22:31 | `agents/react_wrapper.py` | 重写 | `ReactSubAgent` → `GroupChatOrchestrator`；AutoGen GroupChat（user_proxy + researcher + analyst + verifier + GroupChatManager） |
+| 2026-02-19 22:31 | `agents/prompts.py` | 重写 | 三个 prompt 改为 GroupChat 协作版：角色感知、交叉验证、实时互动指令 |
+| 2026-02-19 22:31 | `graph/nodes.py` | 重写 | 删除 `supervisor_decide` / `research_execute` / `analysis_execute` / `verify_execute`；新增 `group_chat_execute` |
+| 2026-02-19 22:31 | `graph/supervisor.py` | 重写 | 条件循环图 → 线性流水线：analyze → decompose → group_chat → synthesize → format → END |
+| 2026-02-19 22:31 | `config/settings.py` | 修改 | 新增 `MAX_GROUP_CHAT_ROUNDS = 20` |
+| 2026-02-19 22:31 | `main.py` | 修改 | 架构描述更新为 `LangGraph Pipeline + AutoGen GroupChat` |
 
 <!--
+修改详情（2026-02-19 21:00 批次）：
+
+13. **tools/serper_search.py（新建）**
+    - 封装 Serper.dev Google Search API（POST https://google.serper.dev/search）
+    - 认证方式：X-API-KEY header
+    - 解析 organic 搜索结果 + Knowledge Graph（如有）
+    - 输出格式与 BochaSearchTool 保持一致（标题/URL/摘要）
+
+14. **config/settings.py（Serper 配置）**
+    - SERPER_API_KEY / SERPER_BASE_URL / SERPER_DEFAULT_COUNT
+    - 博查注释标注为"中文搜索"，Serper 标注为"英文 Google 搜索"
+
+15. **agents/react_wrapper.py（搜索路由+去重+熔断）**
+    - 语言路由：`_has_chinese()` 检测查询是否含中文字符，中文→博查，英文→Serper
+    - 搜索去重：`_normalize_query()` 归一化 + `_is_duplicate_query()` 精确/模糊匹配（SequenceMatcher ≥ 0.85）
+    - 命中缓存时返回提示引导 agent 换角度，避免浪费步数
+    - LLM 连续失败熔断：`consecutive_errors >= 3` 时终止，避免无限循环
+
+16. **agents/prompts.py（搜索工具注意事项）**
+    - 三个 prompt 均新增"搜索工具注意事项"段落
+    - 明确禁止 site: / intitle: / -排除词 / "" 精确匹配等 Google 高级语法
+    - 引导英文问题用英文搜索、中文问题用中文搜索
+
+17. **graph/nodes.py（答案质量提升）**
+    - `synthesize` prompt 新增 6 条输出规则，强制只输出答案本身
+    - `format_answer` 改为两层架构：
+      第一层：LLM 提取纯净答案（去解释文字、语言一致性、格式遵循）
+      第二层：`post_process_answer()` 规则后处理（小写/整数化/逗号空格）
+    - 如果格式要求含大写示例，跳过小写转换保留 LLM 提取的原始大小写
+
+修改详情（2026-02-19 21:10 批次）：
+
+18. **agents/react_wrapper.py（模型驱动搜索引擎选择）**
+    - `_parse_action()` 正则从 `(search|code)` 扩展为 `(search_google|search_bocha|search|code)`
+    - `run()` 中搜索分支条件从 `action_type == "search"` 改为 `action_type in ("search_google", "search_bocha")`
+    - 移除硬编码的 `_has_chinese()` 语言路由，改由模型通过 Action 类型选择引擎
+    - 兼容旧格式 `Action: search`：保留 `_has_chinese()` 作为 fallback 推断引擎
+    - 无效 Action 提示文本更新为列出 `search_google` / `search_bocha` / `code` 三个选项
+
+19. **agents/prompts.py（双搜索工具 Prompt）**
+    - 三个 prompt 中的 `Action: search` 替换为 `Action: search_google` 和 `Action: search_bocha`
+    - 工具选择说明改为"根据搜索内容的地域相关性选择引擎"，而非"根据查询语言选择"
+    - 举例：中文问题问国外内容 → search_google + 英文查询；英文问题问中国内容 → search_bocha + 中文查询
+
+修改详情（2026-02-19 22:07 批次 —— Function Calling 重构）：
+
+20. **agents/react_wrapper.py（重写：文本 ReAct → AutoGen Function Calling）**
+    **之前**：`generate_reply()` 返回纯文本 → `_parse_action()` 正则匹配 `Action: search_google` → 手动路由执行
+    **之后**：`register_for_llm()` + `register_for_execution()` 注册工具 → `initiate_chat()` 驱动 assistant↔executor 对话
+    - 删除所有文本解析方法：`_parse_action()`, `_extract_thought()`, `_extract_final_answer()`, `_force_conclusion()`, `_trim_conversation()`
+    - 新增 `_register_tools()`：将 `search_google`, `search_bocha`, `run_code` 注册为 function calling 工具
+    - 新增 `_execute_search()`, `_execute_code()`：工具执行函数，内含去重逻辑
+    - 新增 `_extract_result()`：从 `ChatResult.summary` / `chat_history` 提取最终结果
+    - `run()` 改为调用 `self.executor.initiate_chat(self.assistant, ...)`
+    - 终止条件：assistant 消息中包含 "TERMINATE"
+
+21. **agents/prompts.py（重写：适配 Function Calling）**
+    - 移除手动 `Action: / Action Input:` 格式说明（function calling 由 API 层处理）
+    - 工具描述改为概要式（详细 schema 由 `register_for_llm` 的 `description` + `Annotated` 提供）
+    - 新增 TERMINATE 终止指令
+    - `search_google` 允许 Google 高级语法（"精确匹配"、`site:`、`intitle:` 等）
+    - `search_bocha` 明确标注"仅支持自然语言查询"
+
+修改详情（2026-02-19 22:31 批次 —— GroupChat 多智能体协作）：
+
+22. **agents/react_wrapper.py（重写：GroupChat 多智能体协作）**
+    **之前**：`ReactSubAgent` 单代理 function calling（assistant + executor 1对1 对话）
+    **之后**：`GroupChatOrchestrator` 多代理 GroupChat（user_proxy + researcher + analyst + verifier）
+    - 删除 `ReactSubAgent` 类，新建 `GroupChatOrchestrator` 类
+    - 4 个代理在同一 `GroupChat` 中交互，共享对话历史
+    - `GroupChatManager`（有 LLM）自动选择下一位发言者
+    - 工具注册改为循环：3 个 LLM 代理共用 `register_for_llm`，`user_proxy` 统一 `register_for_execution`
+    - 搜索去重缓存在 GroupChat 全局共享
+    - `run()` 接口从 `(task, context)` 改为 `(question, sub_questions, context)`
+    - 新增 `extract_evidence_from_history()` 从对话历史提取证据
+
+23. **agents/prompts.py（GroupChat 协作版 Prompt）**
+    - 三个 prompt 均加入角色定位：明确 "你是 GroupChat 中的 researcher/analyst/verifier"
+    - 加入协作感知：描述其他代理的角色和能力
+    - 加入交叉验证指令：verifier 在 researcher 每次提供信息后即时介入
+    - 加入互动规则：质疑不确定信息、补充遗漏线索、修正错误结论
+
+24. **graph/nodes.py（节点简化）**
+    - 删除：`supervisor_decide`、`research_execute`、`analysis_execute`、`verify_execute`（4 个节点）
+    - 新增：`group_chat_execute`（1 个节点，替代上述 4 个）
+    - `group_chat_execute` 创建 `GroupChatOrchestrator` 实例，运行后提取证据和结论
+    - 保留：`analyze_question`、`decompose_question`、`synthesize`、`format_answer`
+
+25. **graph/supervisor.py（图结构简化）**
+    - **之前**：条件循环图（supervisor_decide → 条件路由 → 子代理 → 回到 supervisor）
+    - **之后**：线性流水线（analyze → decompose → group_chat → synthesize → format → END）
+    - 删除 `_route_after_supervisor` 函数和所有条件边
+
+26. **config/settings.py**
+    - 新增 `MAX_GROUP_CHAT_ROUNDS = 20`（GroupChat 最大对话轮次）
+
+-->
+
 修改详情：
 
 1. **config/settings.py**
@@ -272,10 +385,82 @@ LLM 输出                              CodeExecutor
 - **受限 builtins**：保留 abs/int/float/str/len/range/print/sorted/max/min 等，移除 open/exec/eval/__import__/compile/globals/locals
 - **AST 阻止**：`os.system`、`os.popen`、`os.remove` 等属性调用
 
-### 9. 依赖关系
+### 9. AutoGen GroupChat 多智能体协作架构（`react_wrapper.py`）
+
+```
+GroupChatOrchestrator.__init__()
+  ├── user_proxy   = ConversableAgent(llm_config=False)       ← 发起对话 + 执行工具
+  ├── researcher   = ConversableAgent(RESEARCH_PROMPT, llm)   ← 广度搜索
+  ├── analyst      = ConversableAgent(ANALYSIS_PROMPT, llm)   ← 深度分析
+  ├── verifier     = ConversableAgent(VERIFY_PROMPT, llm)     ← 事实核查
+  ├── _register_tools()
+  │     ├── user_proxy.register_for_execution(search_google/bocha/run_code)
+  │     └── for agent in [researcher, analyst, verifier]:
+  │           agent.register_for_llm(search_google/bocha/run_code)
+  ├── groupchat    = GroupChat(agents=[user_proxy, researcher, analyst, verifier])
+  └── manager      = GroupChatManager(groupchat, llm_config)  ← 自动选择发言者
+
+GroupChatOrchestrator.run(question, sub_questions, context)
+  └── user_proxy.initiate_chat(manager, message=task_prompt)
+        ├── manager 选择 researcher 发言
+        │     researcher 调用 search_google → user_proxy 执行 → 结果返回
+        ├── manager 选择 analyst 发言
+        │     analyst 基于 researcher 的发现进行分析
+        ├── manager 选择 verifier 发言
+        │     verifier 质疑或验证已有结论，可能调用搜索反面验证
+        ├── ... 交叉循环 ...
+        └── 某代理输出含 "TERMINATE" → manager 检测到 → 对话结束
+```
+
+**架构演进对比**：
+| 维度 | 串行 Supervisor 循环 | GroupChat 协作 |
+|------|---------------------|---------------|
+| 代理交互 | 隔离执行，互不可见 | 共享对话，实时可见 |
+| 交叉验证 | 验证失败 → 新一轮循环（浪费） | 验证失败 → 即时修正（高效） |
+| LangGraph 图 | 条件循环（8 节点） | 线性流水线（5 节点） |
+| 搜索去重 | 每个子代理独立缓存 | 全局共享缓存 |
+
+- **search_google**（Serper API）：支持 Google 高级语法（`"精确匹配"`、`site:`、`intitle:` 等）
+- **search_bocha**（博查 API）：仅自然语言查询，不支持高级语法
+- 两个工具输出格式一致（标题/URL/摘要），对 agent 透明
+
+### 10. 搜索去重机制（`react_wrapper.py`）
+
+```
+每次搜索前：
+  1. _normalize_query(query)  → 小写 + 去引号 + 合并空格
+  2. _is_duplicate_query(norm, cache, threshold=0.85)
+     ├── 精确匹配 cache key → 命中
+     └── SequenceMatcher.ratio() ≥ 0.85 → 命中
+  3. 命中 → 返回缓存 + 提示换角度（不消耗 API 配额）
+  4. 未命中 → 执行搜索 → 结果存入 cache
+```
+
+- 缓存生命周期：每个 `run()` 调用（即每个子代理执行期间）
+- 模糊匹配阈值 `DEDUP_SIMILARITY_THRESHOLD = 0.85`，可在类级别调整
+- 命中去重时向 agent 注入提示，引导换不同搜索角度
+
+### 11. LLM 两层答案提取（`graph/nodes.py`）
+
+```
+synthesize 节点
+  └── LLM（强制纯答案输出规则）→ raw_answer
+
+format_answer 节点
+  ├── 第一层：LLM 提取（去解释文字、语言一致性、格式遵循）→ extracted
+  └── 第二层：post_process_answer()（小写/整数化/逗号空格）→ processed
+       └── 如果 format_requirement 含大写示例 → 跳过小写，保留原始大小写
+```
+
+- 不使用正则约束答案格式，完全依赖 LLM 理解题目要求
+- `format_answer` 的 LLM prompt 嵌入完整评判规则（名词/数字、语言一致性、整数化等）
+- 兜底：LLM 提取失败时退回 `raw.strip()`
+
+### 12. 依赖关系
 | 包 | 用途 | 最低版本 |
 |----|------|----------|
 | langgraph | Supervisor 图框架 | 0.0.50 |
 | pyautogen | ConversableAgent 子代理 | 0.2.0 |
 | openai | LLM 调用（火山方舟兼容） | 1.0.0 |
-| requests | 博查搜索 HTTP 请求 | 2.31.0 |
+| requests | 博查 + Serper 搜索 HTTP 请求 | 2.31.0 |
+| difflib | 搜索去重模糊匹配（标准库） | — |

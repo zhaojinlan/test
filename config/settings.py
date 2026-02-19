@@ -28,15 +28,21 @@ else:
 LLM_TEMPERATURE = 0.1
 LLM_MAX_TOKENS = 32000
 
-# ==================== 搜索配置 ====================
+# ==================== 搜索配置（博查 —— 中文搜索）====================
 SEARCH_API_KEY = "sk-3c89d90cb20c4072be599632958e7157"
 SEARCH_BASE_URL = "https://api.bocha.cn/v1/web-search"
 SEARCH_DEFAULT_COUNT = 10
 SEARCH_FRESHNESS = "noLimit"
 
+# ==================== 搜索配置（Serper —— 英文 Google 搜索）====================
+SERPER_API_KEY = "704534631cedfd6842d9bb8da64bb8fd0eee1a59"
+SERPER_BASE_URL = "https://google.serper.dev/search"
+SERPER_DEFAULT_COUNT = 10
+
 # ==================== 系统配置 ====================
 MAX_SUPERVISOR_ITERATIONS = 10
 MAX_AGENT_STEPS = 8
+MAX_GROUP_CHAT_ROUNDS = 20
 
 
 def get_autogen_llm_config() -> dict:

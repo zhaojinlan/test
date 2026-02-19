@@ -7,8 +7,7 @@ import re
 import logging
 from graph.state import SupervisorState
 from utils.llm_client import call_llm
-from agents.react_wrapper import ReactSubAgent
-from agents.prompts import RESEARCH_SYSTEM_PROMPT, ANALYSIS_SYSTEM_PROMPT, VERIFICATION_SYSTEM_PROMPT
+from agents.react_wrapper import GroupChatOrchestrator
 from utils.post_process import post_process_answer
 
 logger = logging.getLogger(__name__)
@@ -107,171 +106,52 @@ def decompose_question(state: SupervisorState) -> dict:
 
 
 # ======================================================================
-# 3. Supervisor 决策节点（外层 ReAct 的 Thought）
+# 3. GroupChat 多智能体协作节点
 # ======================================================================
-def supervisor_decide(state: SupervisorState) -> dict:
+def group_chat_execute(state: SupervisorState) -> dict:
+    """
+    核心执行节点：启动 GroupChat，让 researcher、analyst、verifier
+    在同一对话中协作，实时交叉验证，直到达成共识。
+    """
     question = state["question"]
     sub_questions = state["sub_questions"]
-    evidence = state["evidence_pool"]
-    iteration = state["iteration_count"]
-    max_iter = state["max_iterations"]
 
     print("\n" + "=" * 70)
-    print(f"【Supervisor 决策】第 {iteration + 1}/{max_iter} 轮")
+    print("【节点】GroupChat 多智能体协作")
     print("=" * 70)
 
-    # 构建证据摘要
-    evidence_summary = ""
-    if evidence:
-        for i, ev in enumerate(evidence, 1):
-            src = ev.get("source", "unknown")
-            content = ev.get("content", "")[:300]
-            evidence_summary += f"\n  证据{i} [{src}]: {content}"
-    else:
-        evidence_summary = "\n  （暂无证据）"
-
-    # 构建子问题状态
-    sq_status = ""
-    for sq in sub_questions:
-        status = "✓已解决" if sq.get("resolved") else "○待解决"
-        sq_status += f"\n  [{status}] {sq['content'][:60]}"
-
-    prompt = f"""\
-你是多智能体系统的监督者（Supervisor）。请根据当前系统状态做出路由决策。
-
-原始问题：{question}
-
-子问题列表：{sq_status}
-
-已收集证据：{evidence_summary}
-
-当前轮次：{iteration + 1}/{max_iter}
-
-请分析当前状态，决定下一步操作。你的选择：
-- RESEARCH : 需要更多广度搜索，收集新线索
-- ANALYZE  : 已有初步线索，需要对某方面深入分析
-- VERIFY   : 已有候选答案，需要验证准确性
-- SYNTHESIZE : 信息已充分（或已到最后轮次），综合得出最终答案
-
-请按以下格式回答：
-Thought: <你对当前状态的分析>
-Decision: <RESEARCH 或 ANALYZE 或 VERIFY 或 SYNTHESIZE>
-Task: <给子代理的具体任务描述（如果选择 SYNTHESIZE 可留空）>"""
-
-    response = call_llm(prompt)
-
-    # 解析决策
-    decision_match = re.search(r"Decision:\s*(RESEARCH|ANALYZE|VERIFY|SYNTHESIZE)", response, re.IGNORECASE)
-    decision = decision_match.group(1).upper() if decision_match else "RESEARCH"
-
-    task_match = re.search(r"Task:\s*(.+?)$", response, re.DOTALL)
-    task_desc = task_match.group(1).strip() if task_match else question
-
-    thought_match = re.search(r"Thought:\s*(.+?)(?=Decision:|$)", response, re.DOTALL)
-    reasoning = thought_match.group(1).strip() if thought_match else response[:200]
-
-    # 最后一轮强制 SYNTHESIZE
-    if iteration + 1 >= max_iter and decision != "SYNTHESIZE":
-        decision = "SYNTHESIZE"
-        print(f"  ⚠ 已到最大轮次，强制 SYNTHESIZE")
-
-    print(f"  Thought  : {reasoning[:120]}")
-    print(f"  Decision : {decision}")
-    print(f"  Task     : {task_desc[:100]}")
-
-    return {
-        "next_action": decision,
-        "next_task": task_desc,
-        "supervisor_reasoning": reasoning,
-        "iteration_count": iteration + 1,
-        "reasoning_trace": [f"[Supervisor 轮{iteration+1}] Decision={decision}: {reasoning[:80]}"],
-    }
-
-
-# ======================================================================
-# 4. 研究执行节点（外层 ReAct 的 Action —— 调用研究子代理）
-# ======================================================================
-def research_execute(state: SupervisorState) -> dict:
-    task = state["next_task"]
-    question = state["question"]
-
-    print("\n" + "=" * 70)
-    print("【执行】研究代理（广度搜索 · CoT）")
-    print("=" * 70)
-
-    # 构建上下文
-    context_parts = [f"原始问题：{question}"]
-    if state["evidence_pool"]:
-        context_parts.append("已知信息：")
-        for ev in state["evidence_pool"][-3:]:  # 最近3条证据
-            context_parts.append(f"- {ev.get('content', '')[:200]}")
-    context = "\n".join(context_parts)
-
-    agent = ReactSubAgent(name="research_agent", system_prompt=RESEARCH_SYSTEM_PROMPT)
-    result = agent.run(task=task, context=context)
-
-    return {
-        "evidence_pool": [{"source": "research", "content": result}],
-        "reasoning_trace": [f"[Research] {result[:100]}"],
-    }
-
-
-# ======================================================================
-# 5. 分析执行节点
-# ======================================================================
-def analysis_execute(state: SupervisorState) -> dict:
-    task = state["next_task"]
-    question = state["question"]
-
-    print("\n" + "=" * 70)
-    print("【执行】分析代理（深度分析 · ToT）")
-    print("=" * 70)
-
-    context_parts = [f"原始问题：{question}"]
-    if state["evidence_pool"]:
-        context_parts.append("已收集的线索：")
+    # 构建已有上下文
+    context = ""
+    if state.get("evidence_pool"):
+        context_parts = ["已有信息："]
         for ev in state["evidence_pool"]:
-            context_parts.append(f"- [{ev.get('source','')}] {ev.get('content','')[:300]}")
-    context = "\n".join(context_parts)
+            context_parts.append(
+                f"- [{ev.get('source', '')}] {ev.get('content', '')[:300]}"
+            )
+        context = "\n".join(context_parts)
 
-    agent = ReactSubAgent(name="analysis_agent", system_prompt=ANALYSIS_SYSTEM_PROMPT)
-    result = agent.run(task=task, context=context)
+    # 创建并运行 GroupChat
+    orchestrator = GroupChatOrchestrator()
+    result = orchestrator.run(
+        question=question,
+        sub_questions=sub_questions,
+        context=context,
+    )
+
+    # 从 GroupChat 历史中提取证据
+    evidence_list = orchestrator.extract_evidence_from_history()
 
     return {
-        "evidence_pool": [{"source": "analysis", "content": result}],
-        "reasoning_trace": [f"[Analysis] {result[:100]}"],
+        "evidence_pool": evidence_list if evidence_list else [
+            {"source": "group_chat", "content": result}
+        ],
+        "final_answer": result,
+        "reasoning_trace": [f"[GroupChat] 协作完成，结论: {result[:100]}"],
     }
 
 
 # ======================================================================
-# 6. 验证执行节点
-# ======================================================================
-def verify_execute(state: SupervisorState) -> dict:
-    task = state["next_task"]
-    question = state["question"]
-
-    print("\n" + "=" * 70)
-    print("【执行】验证代理（事实核查 · CoT）")
-    print("=" * 70)
-
-    context_parts = [f"原始问题：{question}"]
-    if state["evidence_pool"]:
-        context_parts.append("待验证的信息：")
-        for ev in state["evidence_pool"]:
-            context_parts.append(f"- [{ev.get('source','')}] {ev.get('content','')[:300]}")
-    context = "\n".join(context_parts)
-
-    agent = ReactSubAgent(name="verify_agent", system_prompt=VERIFICATION_SYSTEM_PROMPT)
-    result = agent.run(task=task, context=context)
-
-    return {
-        "evidence_pool": [{"source": "verification", "content": result}],
-        "reasoning_trace": [f"[Verify] {result[:100]}"],
-    }
-
-
-# ======================================================================
-# 7. 综合节点 —— 汇总所有证据，生成最终答案
+# 4. 综合节点 —— 汇总所有证据，生成最终答案
 # ======================================================================
 def synthesize(state: SupervisorState) -> dict:
     question = state["question"]
@@ -296,12 +176,13 @@ def synthesize(state: SupervisorState) -> dict:
 收集到的所有证据：
 {evidence_text}
 
-请综合以上信息，给出准确的最终答案。
-注意：
-1. 答案必须直接回应问题。
-2. 如果问题要求特定格式，严格遵守。
-3. 只输出答案本身，不要添加解释或前缀。
-4. 答案一般是名词或数字，保证不含无关信息。"""
+【输出规则——极其重要，必须严格遵守】
+1. 只输出答案本身（名词、数字或短语），绝对不要输出任何解释、推理过程、前缀（如"答案是"）。
+2. 如果题目声明了回答格式，严格遵循该格式。
+3. 如果题目没有特殊格式声明，答案语言与问题语言保持一致（中文问题→中文答案，英文问题→英文答案）。
+4. 如果答案是数字，输出整数形式。
+5. 如果答案包含多个实体，用逗号加空格分隔（如: entity1, entity2）。
+6. 不要输出"根据……"、"答案是……"、"无法确定"等任何非答案内容。如果确实无法确定，输出你认为最可能的答案。"""
 
     answer = call_llm(prompt)
     answer = answer.strip()
@@ -319,26 +200,50 @@ def synthesize(state: SupervisorState) -> dict:
 # ======================================================================
 def format_answer(state: SupervisorState) -> dict:
     raw = state["final_answer"]
+    question = state["question"]
+    fmt_req = state.get("format_requirement", "")
 
     print("\n" + "=" * 70)
     print("【节点】答案格式化")
     print("=" * 70)
 
-    fmt_req = state.get("format_requirement", "")
+    # ---- 第一步：LLM 提取纯净答案 ----
+    extract_prompt = f"""\
+你是一个答案格式提取器。你的任务是从下面的原始回答中提取出纯净的最终答案。
 
-    # 如果格式要求包含大写字母示例（如 "Alibaba Group Limited"），不做小写转换
-    if fmt_req and any(c.isupper() for c in fmt_req) and "形如" in fmt_req:
-        processed = raw.strip()
-        # 只做基本清理
+原始问题：{question}
+格式要求：{fmt_req if fmt_req else "无特殊格式要求"}
+原始回答：{raw}
+
+【提取规则】
+1. 只输出答案本身（名词、数字或短语），去掉所有解释性文字。
+2. 如果原始回答中包含"答案是XX"、"因此XX"等句式，只提取 XX 部分。
+3. 如果题目声明了格式要求（如"格式形如：Alibaba Group Limited"），严格按该格式输出。
+4. 如果题目没有特殊格式声明，答案语言与问题语言一致（中文问题→中文答案，英文问题→英文答案）。
+5. 数值答案输出整数形式（如 42，不要 42.0）。
+6. 多实体答案用逗号加空格分隔。
+7. 绝对不要输出任何解释，只输出最终答案。"""
+
+    try:
+        extracted = call_llm(extract_prompt).strip()
+    except Exception as e:
+        logger.error(f"[format_answer] LLM 提取失败: {e}")
+        extracted = raw.strip()
+
+    # ---- 第二步：后处理（纯规则层）----
+    processed = post_process_answer(extracted)
+
+    # 如果格式要求含大写示例，保留 LLM 提取的原始大小写
+    if fmt_req and any(c.isupper() for c in fmt_req):
+        processed = extracted.strip()
         processed = re.sub(r",\s*", ", ", processed)
         processed = re.sub(r";\s*", "; ", processed)
-    else:
-        processed = post_process_answer(raw)
 
     print(f"  原始答案  : {raw}")
+    print(f"  LLM提取   : {extracted}")
     print(f"  处理后答案: {processed}")
 
     return {
         "final_answer": processed,
-        "reasoning_trace": [f"[格式化] {raw} -> {processed}"],
+        "reasoning_trace": [f"[格式化] {raw} -> {extracted} -> {processed}"],
     }

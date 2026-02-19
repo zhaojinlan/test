@@ -78,7 +78,7 @@ def run_question(question: str) -> str:
 
     print("\n" + "█" * 70)
     print("█  多智能体推理系统")
-    print("█  LangGraph Supervisor + AutoGen ReAct Sub-Agents")
+    print("█  LangGraph Pipeline + AutoGen GroupChat")
     print("█" * 70)
     print(f"\n问题：\n{question}\n")
 
