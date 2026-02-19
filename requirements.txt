@@ -1,0 +1,13 @@
+# Core
+openai>=1.0.0
+requests>=2.31.0
+
+# LangGraph
+langgraph>=0.2.0
+langchain-core>=0.2.0
+
+# AutoGen
+pyautogen>=0.2.0
+
+# Utilities
+rich>=13.0.0
