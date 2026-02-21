@@ -1,62 +1,33 @@
-"""
-全局配置 —— LLM / 搜索 / 系统参数
-"""
+# -*- coding: utf-8 -*-
+"""全局配置"""
+import os
 
-# ==================== LLM 选择 ====================
-# 设为 True 使用自建 Ollama（qwen2.5:14b），False 使用火山方舟 doubao
-USE_OLLAMA = True
+# ==================== 关闭 LangSmith 追踪 ====================
+os.environ["LANGSMITH_OTEL_ENABLED"] = "false"
+os.environ["LANGSMITH_TRACING"] = "false"
 
-# ---- 火山方舟 doubao 配置 ----
-DOUBAO_API_KEY = "e31694db-1a7e-4004-b2bc-ed51f6362714"
-DOUBAO_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
-DOUBAO_MODEL = "doubao-seed-1-8-251228"
+# ==================== 火山方舟 LLM 配置 ====================
+LLM_API_KEY = "e31694db-1a7e-4004-b2bc-ed51f6362714"
+LLM_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
+LLM_MODEL_NAME = "doubao-seed-1-8-251228"
 
-# ---- 自建 Ollama 配置 ----
-OLLAMA_BASE_URL = "https://zjlchat.vip.cpolar.cn"
-OLLAMA_MODEL = "qwen2.5:14b"
+# ==================== 博查搜索配置（中文数据为主） ====================
+BOCHA_API_KEY = "sk-3c89d90cb20c4072be599632958e7157"
+BOCHA_BASE_URL = "https://api.bocha.cn/v1/web-search"
+BOCHA_DEFAULT_COUNT = 25
 
-# ---- 根据开关自动选择 ----
-if USE_OLLAMA:
-    LLM_API_KEY = "ollama"                        # Ollama 不需要真实 key
-    LLM_BASE_URL = OLLAMA_BASE_URL + "/v1"         # Ollama OpenAI 兼容端点
-    LLM_MODEL = OLLAMA_MODEL
-else:
-    LLM_API_KEY = DOUBAO_API_KEY
-    LLM_BASE_URL = DOUBAO_BASE_URL
-    LLM_MODEL = DOUBAO_MODEL
-
-LLM_TEMPERATURE = 0.1
-LLM_MAX_TOKENS = 32000
-
-# ==================== 搜索配置（博查 —— 中文搜索）====================
-SEARCH_API_KEY = "sk-3c89d90cb20c4072be599632958e7157"
-SEARCH_BASE_URL = "https://api.bocha.cn/v1/web-search"
-SEARCH_DEFAULT_COUNT = 10
-SEARCH_FRESHNESS = "noLimit"
-
-# ==================== 搜索配置（Serper —— 英文 Google 搜索）====================
+# ==================== Serper 搜索配置（国际数据为主） ====================
 SERPER_API_KEY = "704534631cedfd6842d9bb8da64bb8fd0eee1a59"
 SERPER_BASE_URL = "https://google.serper.dev/search"
-SERPER_DEFAULT_COUNT = 10
+SERPER_DEFAULT_NUM = 25
 
-# ==================== 系统配置 ====================
-MAX_SUPERVISOR_ITERATIONS = 10
-MAX_AGENT_STEPS = 8
-MAX_GROUP_CHAT_ROUNDS = 20
+# ==================== 百度百科 API 配置（精确实体查询） ====================
+BAIKE_API_KEY = "bce-v3/ALTAK-qyKOeBWeopfC6j5236hgq/93348634914b3067fb365bf73d20a39901aae0a0"
+BAIKE_LIST_URL = "https://appbuilder.baidu.com/v2/baike/lemma/get_list_by_title"
+BAIKE_CONTENT_URL = "https://appbuilder.baidu.com/v2/baike/lemma/get_content"
 
-
-def get_autogen_llm_config() -> dict:
-    """返回 AutoGen ConversableAgent 所需的 llm_config"""
-    return {
-        "config_list": [
-            {
-                "model": LLM_MODEL,
-                "api_key": LLM_API_KEY,
-                "base_url": LLM_BASE_URL,
-                "temperature": LLM_TEMPERATURE,
-                "max_tokens": LLM_MAX_TOKENS,
-            }
-        ],
-        "timeout": 120,
-        "cache_seed": None,
-    }
+# ==================== 系统参数 ====================
+MAX_SEARCH_RETRIES = 2          # 单次搜索最大重试
+MAX_LOOPS = 4                   # 主循环最大次数（decompose→parallel_research→verify 算一轮）
+RECURSION_LIMIT = 100           # LangGraph 递归上限
+MAX_BAIKE_VERIFY = 1            # 每个研究分支最多触发的百科验证次数

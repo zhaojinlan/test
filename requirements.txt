@@ -1,13 +1,13 @@
-# Core
-openai>=1.0.0
+# Python 3.11
+# 多智能体推理系统依赖
+
+# LangChain & LangGraph
+langchain-core>=0.3.0
+langchain-openai>=0.2.0
+langgraph>=0.2.0
+
+# HTTP 请求
 requests>=2.31.0
 
-# LangGraph
-langgraph>=0.2.0
-langchain-core>=0.2.0
-
-# AutoGen
-pyautogen>=0.2.0
-
-# Utilities
+# 日志与控制台
 rich>=13.0.0

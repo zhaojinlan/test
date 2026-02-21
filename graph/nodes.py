@@ -1,249 +1,536 @@
+# -*- coding: utf-8 -*-
 """
-LangGraph 节点函数
-每个函数接收 SupervisorState，返回状态更新 dict
+所有图节点函数 — Send API 并行研究架构
+节点：decompose_plan / research_branch / global_verify / global_summary / format_answer
 """
-
 import re
-import logging
-from graph.state import SupervisorState
-from utils.llm_client import call_llm
-from agents.react_wrapper import GroupChatOrchestrator
-from utils.post_process import post_process_answer
+from typing import List
 
-logger = logging.getLogger(__name__)
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage
 
-
-# ======================================================================
-# 1. 问题分析节点 —— 提取格式要求
-# ======================================================================
-def analyze_question(state: SupervisorState) -> dict:
-    question = state["question"]
-
-    print("\n" + "=" * 70)
-    print("【节点】问题分析 —— 提取格式要求")
-    print("=" * 70)
-
-    prompt = f"""\
-请仔细阅读以下问题，提取其中对答案格式的明确要求。
-
-问题：
-{question}
-
-如果题目中声明了回答格式（如"格式形如：XXX"），请原样输出该格式要求。
-如果没有明确格式要求，请输出"无特殊格式要求"。
-只输出格式要求本身，不要添加任何解释。"""
-
-    fmt = call_llm(prompt)
-    print(f"  格式要求: {fmt}")
-
-    return {
-        "format_requirement": fmt.strip(),
-        "reasoning_trace": [f"[分析] 格式要求: {fmt.strip()}"],
-    }
+from config.settings import (
+    LLM_API_KEY, LLM_BASE_URL, LLM_MODEL_NAME,
+    MAX_SEARCH_RETRIES, MAX_LOOPS, MAX_BAIKE_VERIFY,
+)
+from graph.state import AgentState, SubQuestion, Evidence
+from tools.search import bocha_search, serper_search, auto_search, fetch_url_content, baike_search
+from agents.prompts import (
+    DECOMPOSE_PLAN_PROMPT, RESEARCH_REFLECT_PROMPT,
+    RESEARCH_EVIDENCE_PROMPT, GLOBAL_VERIFY_PROMPT,
+    GLOBAL_SUMMARY_PROMPT, FORMAT_ANSWER_PROMPT,
+)
 
 
-# ======================================================================
-# 2. 问题拆分节点
-# ======================================================================
-def decompose_question(state: SupervisorState) -> dict:
-    question = state["question"]
-
-    print("\n" + "=" * 70)
-    print("【节点】问题拆分 —— 将复杂问题分解为子问题")
-    print("=" * 70)
-
-    prompt = f"""\
-你是一位问题拆解专家。请将以下复杂问题拆分为 2-5 个可独立搜索的子问题。
-
-原始问题：
-{question}
-
-拆分原则：
-1. 每个子问题应聚焦于一个具体的实体、关系或事实。
-2. 子问题之间形成推理链，前面的子问题为后面的提供线索。
-3. 子问题应该是具体的、可搜索的。
-
-请按以下格式输出：
-子问题1: <描述>
-子问题2: <描述>
-...
-
-只输出子问题列表。"""
-
-    response = call_llm(prompt)
-
-    # 解析子问题
-    sub_questions = []
-    pattern = r"子问题\s*(\d+)\s*[:：]\s*(.+?)(?=子问题\s*\d+|$)"
-    matches = re.findall(pattern, response, re.DOTALL)
-
-    for idx, (num, desc) in enumerate(matches):
-        sq = {
-            "id": f"sq_{idx + 1}",
-            "content": desc.strip(),
-            "resolved": False,
-            "result": "",
-        }
-        sub_questions.append(sq)
-        print(f"  子问题 {idx + 1}: {desc.strip()[:80]}")
-
-    # 兜底：如果解析失败，整个问题作为一个子问题
-    if not sub_questions:
-        sub_questions = [{
-            "id": "sq_1",
-            "content": question,
-            "resolved": False,
-            "result": "",
-        }]
-        print(f"  （未成功拆分，使用原始问题）")
-
-    print(f"\n  共拆分为 {len(sub_questions)} 个子问题")
-
-    return {
-        "sub_questions": sub_questions,
-        "reasoning_trace": [f"[拆分] 生成 {len(sub_questions)} 个子问题"],
-    }
-
-
-# ======================================================================
-# 3. GroupChat 多智能体协作节点
-# ======================================================================
-def group_chat_execute(state: SupervisorState) -> dict:
-    """
-    核心执行节点：启动 GroupChat，让 researcher、analyst、verifier
-    在同一对话中协作，实时交叉验证，直到达成共识。
-    """
-    question = state["question"]
-    sub_questions = state["sub_questions"]
-
-    print("\n" + "=" * 70)
-    print("【节点】GroupChat 多智能体协作")
-    print("=" * 70)
-
-    # 构建已有上下文
-    context = ""
-    if state.get("evidence_pool"):
-        context_parts = ["已有信息："]
-        for ev in state["evidence_pool"]:
-            context_parts.append(
-                f"- [{ev.get('source', '')}] {ev.get('content', '')[:300]}"
-            )
-        context = "\n".join(context_parts)
-
-    # 创建并运行 GroupChat
-    orchestrator = GroupChatOrchestrator()
-    result = orchestrator.run(
-        question=question,
-        sub_questions=sub_questions,
-        context=context,
+def _get_llm(temperature: float = 0.2) -> ChatOpenAI:
+    return ChatOpenAI(
+        model=LLM_MODEL_NAME,
+        api_key=LLM_API_KEY,
+        base_url=LLM_BASE_URL,
+        temperature=temperature,
     )
 
-    # 从 GroupChat 历史中提取证据
-    evidence_list = orchestrator.extract_evidence_from_history()
+
+def _evidence_summary(evidence_pool: list) -> str:
+    """格式化证据池为可读文本"""
+    if not evidence_pool:
+        return "（暂无证据）"
+    lines = []
+    for e in evidence_pool:
+        lines.append(f"  [E{e['id']}] (可靠性:{e['reliability']}) {e['statement']}")
+    return "\n".join(lines)
+
+
+def _sub_questions_summary(sub_questions: List[SubQuestion]) -> str:
+    """格式化子问题列表为可读文本"""
+    if not sub_questions:
+        return "（暂无子问题）"
+    lines = []
+    for sq in sub_questions:
+        status_icon = {"done": "✓", "pending": "○", "pruned": "✗"}.get(sq["status"], "?")
+        lines.append(f"  [{status_icon}] Q{sq['id']} [{sq['priority']}] {sq['question']}")
+    return "\n".join(lines)
+
+
+def _completed_questions_summary(sub_questions: List[SubQuestion], completed_ids: list) -> str:
+    """格式化已完成的子问题列表"""
+    completed_set = set(completed_ids or [])
+    done = [sq for sq in sub_questions if sq["id"] in completed_set or sq["status"] == "done"]
+    if not done:
+        return "（暂无已完成的子问题）"
+    lines = []
+    for sq in done:
+        lines.append(f"  [✓] Q{sq['id']}: {sq['question']}")
+    return "\n".join(lines)
+
+
+# 高价值页面 URL 模式（百科、维基等信息密集型页面）
+_HIGH_VALUE_URL_PATTERNS = [
+    "baike.baidu.com",
+    "baike.sogou.com",
+]
+
+
+def _extract_urls_from_results(raw_results: str) -> list:
+    """从搜索结果文本中提取所有 URL"""
+    urls = re.findall(r'https?://[^\s\)）\]]+', raw_results)
+    return urls
+
+
+def _deep_read_promising_urls(raw_results: str, max_reads: int = 2) -> str:
+    """从搜索结果中识别高价值 URL（百科/wiki 类），读取完整页面内容。"""
+    urls = _extract_urls_from_results(raw_results)
+    read_contents = []
+
+    for url in urls:
+        if len(read_contents) >= max_reads:
+            break
+        if any(pattern in url for pattern in _HIGH_VALUE_URL_PATTERNS):
+            print(f"  [DeepRead] 读取高价值页面: {url}")
+            content = fetch_url_content(url, max_chars=15000)
+            if "[URL读取失败]" not in content and "[URL内容]" in content and len(content) > 100:
+                read_contents.append(content)
+
+    return "\n\n".join(read_contents) if read_contents else ""
+
+
+def _execute_search(engine: str, query: str) -> str:
+    """执行搜索，返回格式化文本"""
+    for attempt in range(MAX_SEARCH_RETRIES):
+        try:
+            if engine == "baike":
+                return baike_search.invoke(query)
+            elif engine == "bocha":
+                return bocha_search.invoke(query)
+            elif engine == "serper":
+                return serper_search.invoke(query)
+            else:
+                return auto_search(query)
+        except Exception as e:
+            if attempt == MAX_SEARCH_RETRIES - 1:
+                return f"[搜索失败] {query}: {e}"
+    return f"[搜索失败] {query}: 重试耗尽"
+
+
+def _extract_baike_entities(reflection: str) -> list:
+    """从反思结果中提取建议百科验证的实体名称"""
+    entities = []
+    if "## 建议百科验证的实体" in reflection:
+        section = reflection.split("## 建议百科验证的实体")[1].strip()
+        # 取到下一个 ## 或末尾
+        if "##" in section:
+            section = section.split("##")[0].strip()
+        for line in section.split("\n"):
+            line = line.strip().strip("-").strip("•").strip()
+            if line and line != "无" and len(line) > 0 and len(line) < 30:
+                entities.append(line)
+    return entities[:2]
+
+
+# ==================== 节点 1：问题拆分和规划（ToT + 奥卡姆剃刀） ====================
+
+def decompose_plan(state: AgentState) -> dict:
+    """问题拆分和规划节点 — 奥卡姆剃刀原则，只为缺口生成子问题"""
+    print(f"\n{'='*60}")
+    print(f"[DecomposePlan] 分析问题并规划搜索策略（奥卡姆剃刀）...")
+    print(f"{'='*60}")
+
+    llm = _get_llm()
+
+    existing_evidence = _evidence_summary(state.get("evidence_pool", []))
+    completed_questions = _completed_questions_summary(
+        state.get("sub_questions", []),
+        state.get("completed_question_ids", []),
+    )
+
+    # 先更新已有子问题状态（标记已完成的）
+    completed_set = set(state.get("completed_question_ids", []))
+    all_questions = list(state.get("sub_questions", []))
+    for sq in all_questions:
+        if sq["id"] in completed_set and sq["status"] == "pending":
+            sq["status"] = "done"
+
+    prompt = DECOMPOSE_PLAN_PROMPT.format(
+        question=state["original_question"],
+        existing_evidence=existing_evidence,
+        completed_questions=completed_questions,
+    )
+
+    response = llm.invoke([HumanMessage(content=prompt)])
+    content = response.content.strip()
+
+    # 解析锚点分析
+    anchor_analysis = ""
+    if "## 锚点分析" in content:
+        anchor_section = content.split("## 锚点分析")[1]
+        anchor_analysis = anchor_section.split("## 子问题列表")[0].strip() if "## 子问题列表" in anchor_section else anchor_section.strip()
+
+    # 解析子问题列表
+    existing_ids = {sq["id"] for sq in all_questions}
+    next_id = max(existing_ids) + 1 if existing_ids else 1
+
+    new_questions: List[SubQuestion] = []
+    current_q = {"question": "", "engine": "both", "priority": "中", "purpose": ""}
+
+    sq_section = ""
+    if "## 子问题列表" in content:
+        sq_section = content.split("## 子问题列表")[1].strip()
+
+    for line in sq_section.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+
+        if re.match(r'^\d+[\.\)）、]', line):
+            if current_q["question"]:
+                new_questions.append(SubQuestion(
+                    id=next_id,
+                    question=current_q["question"],
+                    purpose=current_q["purpose"],
+                    priority=current_q["priority"],
+                    status="pending",
+                    search_engine=current_q["engine"],
+                    raw_results="",
+                    reflection="",
+                ))
+                next_id += 1
+
+            stripped = re.sub(r'^\d+[\.\)）、]\s*', '', line).strip()
+            if "问题：" in stripped or "问题:" in stripped:
+                current_q["question"] = stripped.split("问题：")[-1].split("问题:")[-1].strip()
+            else:
+                current_q["question"] = stripped
+            current_q["engine"] = "both"
+            current_q["priority"] = "中"
+            current_q["purpose"] = ""
+
+        elif "引擎：" in line or "引擎:" in line:
+            eng = line.split("引擎：")[-1].split("引擎:")[-1].strip().lower()
+            if "baike" in eng:
+                current_q["engine"] = "baike"
+            elif "bocha" in eng:
+                current_q["engine"] = "bocha"
+            elif "serper" in eng:
+                current_q["engine"] = "serper"
+            else:
+                current_q["engine"] = "both"
+
+        elif "重要性：" in line or "重要性:" in line:
+            pri = line.split("重要性：")[-1].split("重要性:")[-1].strip()
+            if "高" in pri:
+                current_q["priority"] = "高"
+            elif "低" in pri:
+                current_q["priority"] = "低"
+            else:
+                current_q["priority"] = "中"
+
+        elif "目的：" in line or "目的:" in line:
+            current_q["purpose"] = line.split("目的：")[-1].split("目的:")[-1].strip()
+
+    if current_q["question"]:
+        new_questions.append(SubQuestion(
+            id=next_id,
+            question=current_q["question"],
+            purpose=current_q["purpose"] or "获取相关信息",
+            priority=current_q["priority"],
+            status="pending",
+            search_engine=current_q["engine"],
+            raw_results="",
+            reflection="",
+        ))
+
+    # Fallback
+    if not new_questions:
+        new_questions.append(SubQuestion(
+            id=next_id,
+            question=state["original_question"],
+            purpose="直接搜索原始问题",
+            priority="高",
+            status="pending",
+            search_engine="both",
+            raw_results="",
+            reflection="",
+        ))
+
+    # 过滤占位符，限制数量（奥卡姆剃刀：最多4个）
+    placeholder_pat = re.compile(r'\[.+?\]')
+    filtered = [nq for nq in new_questions if not placeholder_pat.search(nq["question"])]
+    if not filtered:
+        filtered = new_questions[:1]
+    filtered = filtered[:4]
+
+    # 合并到已有子问题（去重）
+    existing_texts = {sq["question"] for sq in all_questions}
+    for nq in filtered:
+        if nq["question"] not in existing_texts:
+            all_questions.append(nq)
+
+    print(f"[DecomposePlan] 锚点分析:\n{anchor_analysis}")
+    print(f"[DecomposePlan] 新增 {len(filtered)} 个子问题，总计 {len(all_questions)} 个")
+    for sq in all_questions:
+        print(f"  [{sq['status']}][{sq['priority']}] Q{sq['id']}: {sq['question']}")
 
     return {
-        "evidence_pool": evidence_list if evidence_list else [
-            {"source": "group_chat", "content": result}
-        ],
-        "final_answer": result,
-        "reasoning_trace": [f"[GroupChat] 协作完成，结论: {result[:100]}"],
+        "sub_questions": all_questions,
+        "anchor_analysis": anchor_analysis,
     }
 
 
-# ======================================================================
-# 4. 综合节点 —— 汇总所有证据，生成最终答案
-# ======================================================================
-def synthesize(state: SupervisorState) -> dict:
-    question = state["question"]
-    fmt = state["format_requirement"]
-    evidence = state["evidence_pool"]
+# ==================== 节点 2：研究分支（并行，由 Send API 调度） ====================
 
-    print("\n" + "=" * 70)
-    print("【节点】综合汇总 —— 生成最终答案")
-    print("=" * 70)
+def research_branch(state: AgentState) -> dict:
+    """研究分支节点 — 由 Send API 并行调度，完成搜索→反思→百科验证→证据提取全流程"""
+    sq = state.get("current_branch_question", {})
+    if not sq:
+        print(f"[ResearchBranch] 无子问题，跳过")
+        return {"evidence_pool": [], "completed_question_ids": []}
 
-    evidence_text = ""
-    for i, ev in enumerate(evidence, 1):
-        evidence_text += f"\n证据{i} [{ev.get('source','')}]:\n{ev.get('content','')}\n"
+    q_id = sq["id"]
+    engine = sq.get("search_engine", "both")
+    query = sq["question"]
 
-    prompt = f"""\
-请根据以下所有证据，回答原始问题。
+    print(f"\n[ResearchBranch] 处理 Q{q_id} [{sq.get('priority', '中')}]: {query}")
 
-原始问题：{question}
+    # ===== 阶段1：执行搜索 =====
+    if engine == "both":
+        print(f"  [Search] auto(both): {query}")
+        search_results = _execute_search("auto", query)
+    else:
+        print(f"  [Search] {engine}: {query}")
+        search_results = _execute_search(engine, query)
 
-格式要求：{fmt}
+    print(f"\n  [SearchResults]\n{search_results}\n")
 
-收集到的所有证据：
-{evidence_text}
+    # 深读高价值页面（baike 引擎已返回完整内容，跳过）
+    deep_content = "" if engine == "baike" else _deep_read_promising_urls(search_results, max_reads=2)
+    if deep_content:
+        search_results += "\n\n--- 以下为高价值页面的完整内容 ---\n\n" + deep_content
+        print(f"\n  [DeepRead] 已补充 {deep_content.count('[URL内容]')} 个页面的完整内容\n")
 
-【输出规则——极其重要，必须严格遵守】
-1. 只输出答案本身（名词、数字或短语），绝对不要输出任何解释、推理过程、前缀（如"答案是"）。
-2. 如果题目声明了回答格式，严格遵循该格式。
-3. 如果题目没有特殊格式声明，答案语言与问题语言保持一致（中文问题→中文答案，英文问题→英文答案）。
-4. 如果答案是数字，输出整数形式。
-5. 如果答案包含多个实体，用逗号加空格分隔（如: entity1, entity2）。
-6. 不要输出"根据……"、"答案是……"、"无法确定"等任何非答案内容。如果确实无法确定，输出你认为最可能的答案。"""
+    # ===== 阶段2：LLM 反思 =====
+    llm = _get_llm(temperature=0.1)
+    evidence_text = _evidence_summary(state.get("evidence_pool", []))
 
-    answer = call_llm(prompt)
-    answer = answer.strip()
+    reflect_prompt = RESEARCH_REFLECT_PROMPT.format(
+        sub_question=query,
+        purpose=sq.get("purpose", ""),
+        original_question=state["original_question"],
+        evidence_summary=evidence_text,
+        search_results=search_results[:12000],
+    )
 
-    print(f"  综合答案: {answer}")
+    response = llm.invoke([HumanMessage(content=reflect_prompt)])
+    reflection = response.content.strip()
+    print(f"[ResearchBranch] Q{q_id} 反思完成")
+
+    # ===== 阶段3：百科验证（自动触发） =====
+    baike_supplement = ""
+    if engine != "baike":
+        baike_entities = _extract_baike_entities(reflection)
+        if baike_entities:
+            baike_parts = []
+            for entity in baike_entities[:MAX_BAIKE_VERIFY]:
+                print(f"  [BaikeVerify] 验证实体: {entity}")
+                try:
+                    baike_result = baike_search.invoke(entity)
+                    if "未找到" not in baike_result and "查询异常" not in baike_result:
+                        baike_parts.append(f"百度百科验证 [{entity}]:\n{baike_result[:5000]}")
+                except Exception as e:
+                    print(f"  [BaikeVerify] 失败: {e}")
+            if baike_parts:
+                baike_supplement = "\n\n--- 百度百科验证补充 ---\n\n" + "\n\n".join(baike_parts)
+                print(f"  [BaikeVerify] 已补充 {len(baike_parts)} 个实体的百科信息")
+
+    # ===== 阶段4：证据提取 =====
+    evidence_prompt = RESEARCH_EVIDENCE_PROMPT.format(
+        sub_question=query,
+        reflection=reflection[:6000],
+        baike_supplement=baike_supplement[:4000] if baike_supplement else "",
+    )
+
+    response = llm.invoke([HumanMessage(content=evidence_prompt)])
+    content = response.content.strip()
+
+    # 解析证据陈述和可靠性
+    statement = ""
+    reliability = "low"
+
+    if "证据陈述：" in content or "证据陈述:" in content:
+        statement = content.split("证据陈述：")[-1].split("证据陈述:")[-1].split("\n")[0].strip()
+    else:
+        for line in content.split("\n"):
+            line = line.strip()
+            if line and len(line) > 5 and "可靠性" not in line:
+                statement = line
+                break
+
+    if "可靠性：" in content or "可靠性:" in content:
+        rel_text = content.split("可靠性：")[-1].split("可靠性:")[-1].strip().split("\n")[0].lower()
+        if "high" in rel_text or "高" in rel_text:
+            reliability = "high"
+        elif "medium" in rel_text or "中" in rel_text:
+            reliability = "medium"
+
+    if not statement:
+        statement = f"关于Q{q_id}的搜索未获得有效信息"
+
+    # 构造证据（使用 q_id 作为 evidence id 基础，避免并行冲突）
+    source_urls = re.findall(r'https?://[^\s\)）\]]+', search_results[:5000])[:3]
+
+    new_evidence = Evidence(
+        id=q_id * 10,
+        source_question_id=q_id,
+        statement=statement,
+        source_urls=source_urls,
+        reliability=reliability,
+    )
+
+    print(f"[ResearchBranch] Q{q_id} → E{new_evidence['id']}: {statement}")
+    print(f"[ResearchBranch] 可靠性: {reliability}")
 
     return {
-        "final_answer": answer,
-        "reasoning_trace": [f"[综合] 最终答案: {answer}"],
+        "evidence_pool": [new_evidence],
+        "completed_question_ids": [q_id],
     }
 
 
-# ======================================================================
-# 8. 格式化输出节点
-# ======================================================================
-def format_answer(state: SupervisorState) -> dict:
-    raw = state["final_answer"]
-    question = state["question"]
-    fmt_req = state.get("format_requirement", "")
+# ==================== 节点 3：全局验证（GoT — 推理链评估） ====================
 
-    print("\n" + "=" * 70)
-    print("【节点】答案格式化")
-    print("=" * 70)
+def global_verify(state: AgentState) -> dict:
+    """全局验证节点 — 评估推理链完整性（取代刚性覆盖率百分比）"""
+    loop = state.get("loop_count", 0) + 1
+    print(f"\n{'='*60}")
+    print(f"[GlobalVerify] 推理链评估（第 {loop} 轮）")
+    print(f"{'='*60}")
 
-    # ---- 第一步：LLM 提取纯净答案 ----
-    extract_prompt = f"""\
-你是一个答案格式提取器。你的任务是从下面的原始回答中提取出纯净的最终答案。
+    # 先更新子问题状态
+    completed_set = set(state.get("completed_question_ids", []))
+    sub_questions = list(state.get("sub_questions", []))
+    for sq in sub_questions:
+        if sq["id"] in completed_set and sq["status"] == "pending":
+            sq["status"] = "done"
 
-原始问题：{question}
-格式要求：{fmt_req if fmt_req else "无特殊格式要求"}
-原始回答：{raw}
+    llm = _get_llm(temperature=0.1)
 
-【提取规则】
-1. 只输出答案本身（名词、数字或短语），去掉所有解释性文字。
-2. 如果原始回答中包含"答案是XX"、"因此XX"等句式，只提取 XX 部分。
-3. 如果题目声明了格式要求（如"格式形如：Alibaba Group Limited"），严格按该格式输出。
-4. 如果题目没有特殊格式声明，答案语言与问题语言一致（中文问题→中文答案，英文问题→英文答案）。
-5. 数值答案输出整数形式（如 42，不要 42.0）。
-6. 多实体答案用逗号加空格分隔。
-7. 绝对不要输出任何解释，只输出最终答案。"""
+    sq_summary = _sub_questions_summary(sub_questions)
+    all_evidence = _evidence_summary(state.get("evidence_pool", []))
 
-    try:
-        extracted = call_llm(extract_prompt).strip()
-    except Exception as e:
-        logger.error(f"[format_answer] LLM 提取失败: {e}")
-        extracted = raw.strip()
+    prompt = GLOBAL_VERIFY_PROMPT.format(
+        question=state["original_question"],
+        sub_questions_summary=sq_summary,
+        all_evidence=all_evidence,
+    )
 
-    # ---- 第二步：后处理（纯规则层）----
-    processed = post_process_answer(extracted)
+    response = llm.invoke([HumanMessage(content=prompt)])
+    content = response.content.strip()
 
-    # 如果格式要求含大写示例，保留 LLM 提取的原始大小写
-    if fmt_req and any(c.isupper() for c in fmt_req):
-        processed = extracted.strip()
-        processed = re.sub(r",\s*", ", ", processed)
-        processed = re.sub(r";\s*", "; ", processed)
+    # 剥离 markdown 格式符号后解析
+    content_clean = content.replace("**", "").replace("*", "")
+    content_clean = re.sub(r'^[\s\-]+', '', content_clean, flags=re.MULTILINE)
 
-    print(f"  原始答案  : {raw}")
-    print(f"  LLM提取   : {extracted}")
-    print(f"  处理后答案: {processed}")
+    is_sufficient = False
+    best_answer = ""
+    reasoning_chain = ""
 
-    return {
-        "final_answer": processed,
-        "reasoning_trace": [f"[格式化] {raw} -> {extracted} -> {processed}"],
+    # 提取推理链
+    if "## 推理链" in content_clean:
+        rc_section = content_clean.split("## 推理链")[1]
+        reasoning_chain = rc_section.split("## 判断")[0].strip() if "## 判断" in rc_section else rc_section.strip()
+
+    # 提取判断
+    if "## 判断" in content_clean:
+        judgment = content_clean.split("## 判断")[1].strip()
+        if "充分性：充分" in judgment or "充分性:充分" in judgment or "充分性： 充分" in judgment:
+            is_sufficient = True
+        if "当前最佳答案：" in judgment or "当前最佳答案:" in judgment:
+            best_answer = judgment.split("当前最佳答案：")[-1].split("当前最佳答案:")[-1].split("\n")[0].strip()
+
+    # 循环次数达到上限，强制通过
+    if loop >= MAX_LOOPS:
+        is_sufficient = True
+        print(f"[GlobalVerify] 达到最大循环次数 {MAX_LOOPS}，强制通过")
+
+    print(f"[GlobalVerify] 充分性: {'充分' if is_sufficient else '不充分'}")
+    if best_answer:
+        print(f"[GlobalVerify] 当前最佳答案: {best_answer}")
+    print(f"[GlobalVerify] 完整验证输出:\n{content}")
+
+    result = {
+        "sub_questions": sub_questions,
+        "reasoning_chain": reasoning_chain,
+        "is_sufficient": is_sufficient,
+        "loop_count": loop,
     }
+
+    if best_answer:
+        result["final_answer"] = best_answer
+
+    return result
+
+
+# ==================== 节点 4：全局总结（CoT） ====================
+
+def global_summary(state: AgentState) -> dict:
+    """全局总结节点 — 使用推理链推导最终答案"""
+    print(f"\n{'='*60}")
+    print(f"[GlobalSummary] 生成最终答案...")
+    print(f"{'='*60}")
+
+    llm = _get_llm(temperature=0.1)
+
+    all_evidence = _evidence_summary(state.get("evidence_pool", []))
+    reasoning_chain = state.get("reasoning_chain", "（无推理链）")
+
+    prompt = GLOBAL_SUMMARY_PROMPT.format(
+        question=state["original_question"],
+        all_evidence=all_evidence,
+        reasoning_chain=reasoning_chain[:6000],
+    )
+
+    response = llm.invoke([HumanMessage(content=prompt)])
+    content = response.content.strip()
+
+    answer = ""
+    if "## 最终答案" in content:
+        answer = content.split("## 最终答案")[1].strip().split("\n")[0].strip()
+    elif "最终答案" in content:
+        answer = content.split("最终答案")[-1].strip().split("\n")[0].strip().lstrip("：:").strip()
+
+    if not answer:
+        answer = state.get("final_answer", "")
+
+    if not answer:
+        for line in reversed(content.split("\n")):
+            line = line.strip()
+            if line and len(line) > 3:
+                answer = line
+                break
+
+    print(f"[GlobalSummary] 最终答案: {answer}")
+
+    return {"final_answer": answer}
+
+
+# ==================== 节点 5：答案格式化 ====================
+
+def format_answer(state: AgentState) -> dict:
+    """格式化最终答案"""
+    print(f"\n[FormatAnswer] 格式化...")
+
+    raw = state.get("final_answer", "")
+    if not raw:
+        print(f"[FormatAnswer] 无答案可格式化")
+        return {"formatted_answer": ""}
+
+    llm = _get_llm(temperature=0.0)
+    prompt = FORMAT_ANSWER_PROMPT.format(
+        question=state["original_question"],
+        raw_answer=raw,
+    )
+
+    response = llm.invoke([HumanMessage(content=prompt)])
+    formatted = response.content.strip()
+
+    print(f"[FormatAnswer] 最终输出: {formatted}")
+
+    return {"formatted_answer": formatted}

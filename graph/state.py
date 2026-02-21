@@ -1,53 +1,66 @@
+# -*- coding: utf-8 -*-
 """
-LangGraph 状态定义
-显式、可观测的状态设计，Supervisor 图的核心数据结构
+LangGraph 状态定义 — Send API 并行研究架构
+核心设计：
+- 使用 LangGraph Send API 实现子问题的并行研究
+- Evidence：证据池（累积式 session memory）
+- SubQuestion：带优先级子问题
+- AgentState：主图状态，支持并行分支 + 推理链评估
 """
-
 import operator
-from typing import TypedDict, Annotated
+from typing import Annotated, List, TypedDict
 
 
-class SupervisorState(TypedDict):
-    """Supervisor 条件监督图的全局状态"""
+# ==================== 证据 ====================
 
-    # ---- 输入（初始化后不变）----
-    question: str                                   # 原始问题
-    format_requirement: str                         # 从题目中提取的格式要求
-
-    # ---- 问题拆分 ----
-    sub_questions: list                             # [{id, content, resolved, result}]
-
-    # ---- Supervisor 路由 ----
-    next_action: str                                # RESEARCH / ANALYZE / VERIFY / SYNTHESIZE
-    next_task: str                                  # 传给子代理的具体任务描述
-    supervisor_reasoning: str                       # Supervisor 当前轮的推理过程
-
-    # ---- 计数器 ----
-    iteration_count: int                            # 当前迭代轮数
-    max_iterations: int                             # 最大迭代轮数
-
-    # ---- 累积证据（使用 add reducer）----
-    evidence_pool: Annotated[list, operator.add]    # 所有子代理返回的证据
-
-    # ---- 日志 ----
-    reasoning_trace: Annotated[list, operator.add]  # 推理轨迹日志
-
-    # ---- 输出 ----
-    final_answer: str                               # 最终答案
+class Evidence(TypedDict):
+    """证据池中的单条证据"""
+    id: int
+    source_question_id: int          # 产生该证据的子问题 ID
+    statement: str                   # 陈述性语句（一句话总结）
+    source_urls: List[str]
+    reliability: str                 # high / medium / low
 
 
-def create_initial_state(question: str, max_iterations: int = 10) -> dict:
-    """构造初始状态字典"""
-    return {
-        "question": question,
-        "format_requirement": "",
-        "sub_questions": [],
-        "next_action": "",
-        "next_task": "",
-        "supervisor_reasoning": "",
-        "iteration_count": 0,
-        "max_iterations": max_iterations,
-        "evidence_pool": [],
-        "reasoning_trace": [],
-        "final_answer": "",
-    }
+# ==================== 子问题 ====================
+
+class SubQuestion(TypedDict):
+    """带优先级的子问题"""
+    id: int
+    question: str                    # 搜索查询（bocha用自然语言句子，serper用关键词）
+    purpose: str                     # 搜索目的
+    priority: str                    # 高 / 中 / 低
+    status: str                      # pending / done / pruned
+    search_engine: str               # bocha / serper / baike
+    raw_results: str                 # 原始搜索结果文本
+    reflection: str                  # 反思后的有用信息
+
+
+# ==================== 主图状态 ====================
+
+class AgentState(TypedDict):
+    """主图状态 — 支持 Send API 并行分支"""
+    # 输入
+    original_question: str
+
+    # 拆分规划
+    sub_questions: List[SubQuestion]
+    anchor_analysis: str             # 锚点分析结果
+
+    # 证据池（session memory，累积式）
+    evidence_pool: Annotated[list, operator.add]
+
+    # 并行分支控制（Send API）
+    current_branch_question: dict    # 由 Send 设置，指定当前分支处理的子问题
+    completed_question_ids: Annotated[list, operator.add]  # 已完成的子问题 ID（累积）
+
+    # 全局验证（推理链评估，取代刚性覆盖率）
+    reasoning_chain: str             # 构建的推理链
+    is_sufficient: bool              # 推理链是否充分覆盖问题
+
+    # 循环控制
+    loop_count: int
+
+    # 输出
+    final_answer: str
+    formatted_answer: str
