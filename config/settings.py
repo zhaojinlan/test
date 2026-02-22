@@ -9,7 +9,7 @@ os.environ["LANGSMITH_TRACING"] = "false"
 # ==================== 火山方舟 LLM 配置 ====================
 LLM_API_KEY = "e31694db-1a7e-4004-b2bc-ed51f6362714"
 LLM_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
-LLM_MODEL_NAME = "doubao-seed-1-8-251228"
+LLM_MODEL_NAME = "deepseek-v3-2-251201"
 
 # ==================== 博查搜索配置（中文数据为主） ====================
 BOCHA_API_KEY = "sk-3c89d90cb20c4072be599632958e7157"
@@ -30,4 +30,4 @@ BAIKE_CONTENT_URL = "https://appbuilder.baidu.com/v2/baike/lemma/get_content"
 MAX_SEARCH_RETRIES = 2          # 单次搜索最大重试
 MAX_LOOPS = 4                   # 主循环最大次数（decompose→parallel_research→verify 算一轮）
 RECURSION_LIMIT = 100           # LangGraph 递归上限
-MAX_BAIKE_VERIFY = 1            # 每个研究分支最多触发的百科验证次数
+MAX_BAIKE_VERIFY = 2            # 每个研究分支最多触发的百科验证次数

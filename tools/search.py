@@ -115,7 +115,7 @@ def _format_results(raw: dict, query: str, engine: str) -> str:
 @tool
 def bocha_search(query: str) -> str:
     """搜索中文互联网内容（支持自然语言句子）。适用于：中文问题、中国相关话题、中文百科/论坛/新闻。
-    输入应为完整的中文自然语言句子（如"哪个开源硬件项目的灵感来源于元胞自动机？"），返回搜索结果摘要。"""
+    输入应为完整的中文自然语言句子（如"火影忍者中第七班的成员有哪些？"），返回搜索结果摘要。"""
     try:
         raw = _call_bocha(query)
         return _format_results(raw, query, "博查")
@@ -339,7 +339,7 @@ def fetch_url_content(url: str, max_chars: int = 15000) -> str:
 
 # ==================== 工具列表（供 LLM bind_tools 使用） ====================
 
-ALL_SEARCH_TOOLS = [bocha_search, serper_search]
+ALL_SEARCH_TOOLS = [bocha_search, serper_search, baike_search]
 
 
 def _has_chinese(text: str) -> bool:

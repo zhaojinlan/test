@@ -69,6 +69,122 @@ dataAgent/
 
 ## 变更记录
 
+### 2025-02-22 第十六次修改（并行独立性 + 查询去重 + 多跳交叉验证 — 修复强制通过时的幻觉答案）
+
+**需求**（来自 id=86 推理失败分析）：
+Agent 处理一个三跳关联问题（小微企业调研组成员 ↔ 体育锻炼论文作者 ↔ 80年代空难机组成员同名），耗时 508s 跑满 4 轮 MAX_LOOPS，产出 13 条证据全部标记 low/medium 且明确表示"未获得有效信息"。GlobalVerify 明确输出"无法给出确定答案"，但被强制通过后 GlobalSummary 凭空编造了"林春霞"（仅满足 3 个条件中的 1 个）。
+
+**根因分析（4 项）**：
+1. **依赖型子问题被并行执行**：Q2"根据上一问题确定的空难事故，查找机组成员名单"依赖 Q1 结果，但被 Send API 同时派发，Q2 无上下文执行，浪费搜索配额
+2. **搜索查询跨轮次语义重复**：4 轮中对空难的搜索关键词几乎相同（仅"20世纪80年代"↔"1980年至1989年"的措辞变化），DecomposePlan 未获得已失败查询的具体内容和结果
+3. **强制通过后 GlobalSummary 幻觉**：MAX_LOOPS 触发强制 `is_sufficient=True`，但 GLOBAL_SUMMARY_PROMPT 指令"不要回答'无法确定'"，LLM 从单一证据中随机选了"林春霞"
+4. **多跳问题缺乏交叉验证**：GlobalSummary 未要求答案同时满足问题中所有条件，仅匹配单一条件的实体被当作最终答案
+
+| 时间 | 文件 | 位置 | 修改方法 | 说明 |
+|------|------|------|----------|------|
+| 11:42 | `graph/state.py` | `AgentState` | 新增字段 | 新增 `force_passed: bool`，标记是否因 MAX_LOOPS 强制通过 |
+| 11:42 | `config/settings.py` | L33 | 参数调整 | `MAX_BAIKE_VERIFY`: 1→2，允许每个研究分支更多百科验证 |
+| 11:42 | `agents/prompts.py` | `DECOMPOSE_PLAN_PROMPT` 核心原则 | 新增规则5、6 | 规则5：并行独立——所有子问题并行执行，禁止引用其他子问题结果；规则6：查询多样性——失败后必须换用完全不同的策略 |
+| 11:42 | `agents/prompts.py` | `DECOMPOSE_PLAN_PROMPT` 上下文 | 新增参数 | 新增 `{failed_queries}` 占位符，向 LLM 展示已尝试的搜索方向及结果摘要 |
+| 11:42 | `agents/prompts.py` | `DECOMPOSE_PLAN_PROMPT` 禁止事项 | 修改规则3、新增5-6 | 规则3 强化：禁止语义重复（微调措辞≠新查询）；规则5：禁止依赖型子问题；规则6：连续失败应反思术语理解 |
+| 11:42 | `agents/prompts.py` | `GLOBAL_SUMMARY_PROMPT` 推理步骤 | 新增步骤5、修改步骤6 | 步骤5：多条件交叉验证——多跳问题答案必须同时满足所有条件；步骤6：替换"不要回答无法确定"为更精细的指导 |
+| 11:42 | `graph/nodes.py` | 新增函数 | 新增 | `_failed_queries_summary()`：从已完成子问题+证据池构建搜索历史摘要 |
+| 11:42 | `graph/nodes.py` | `decompose_plan` | 修改 | 调用 `_failed_queries_summary()` 并传入 prompt |
+| 11:42 | `graph/nodes.py` | `global_verify` | 修改 | 强制通过时设置 `force_passed=True` 并写入状态 |
+| 11:42 | `main.py` | `initial_state` | 新增 | 初始化 `force_passed: False` |
+| 11:42 | `Test/run_agent_submit.py` | `initial_state` | 重写 | 更新为 Send API 架构的正确字段（移除废弃的 `current_question_id` 等旧字段） |
+
+<!-- 
+#### 核心设计详解
+
+##### 1. 并行独立性约束（DECOMPOSE_PLAN_PROMPT 规则5）
+Send API 将所有 pending 子问题同时派发执行，每个分支独立运行、互不通信。
+旧行为：LLM 生成 Q2"根据上一问题确定的空难事故，查找机组成员名单"→ Q2 执行时 Q1 尚未完成 → Q2 搜索无上下文 → 浪费配额
+新行为：prompt 明确"所有子问题将被同时并行执行，每个必须完全自包含"→ LLM 不再生成依赖型子问题
+
+##### 2. 搜索历史去重（_failed_queries_summary + {failed_queries}）
+旧行为：DecomposePlan 只看到"已完成的子问题"文本和"证据池"，不知道具体用了什么查询、得到了什么结果 → 生成语义相同的新查询
+新行为：`_failed_queries_summary()` 将每个已完成子问题的查询文本 + 对应证据摘要（含可靠性）组合展示 → LLM 清楚知道哪些方向已试过且失败
+
+##### 3. 多跳交叉验证（GLOBAL_SUMMARY_PROMPT 步骤5）
+旧行为：Summary 从证据池中选"与最多证据一致的"实体 → "林春霞"仅出现在小微企业报告证据中，但因是唯一具体人名被选为答案
+新行为：新增"多条件交叉验证"步骤 → 多跳问题答案必须被验证为同时满足所有条件 → 仅满足单一条件的实体不应作为最终答案
+
+##### 4. Test runner 状态同步（run_agent_submit.py）
+旧行为：initial_state 使用废弃字段（current_question_id, is_verified 等），与当前 Send API 架构不匹配，可能导致 LangGraph 运行时警告或异常
+新行为：更新为与 main.py 一致的 AgentState 字段，包含 force_passed 新字段
+-->
+
+---
+
+### 2025-02-22 第十五次修改（假设审计机制 — 修复解读固化导致的推理死循环）
+
+**需求**（来自 id=82 推理失败分析）：
+Agent 在处理 Q82 时，将"微软研究院在西海岸的首个分部"解读为"远离总部的第一个卫星办公室"（BARC, 1995年），而实际上微软研究院 1991 年创立时的总部 Redmond, WA 本身就在西海岸，即为"首个分部"。Agent 发现 1991（火山）vs 1995（BARC）矛盾后，连续 3 轮搜索试图用新事实调和，从未质疑自己的解读——这是典型的**解读固化**（interpretation fixation）。
+
+| 时间 | 文件 | 位置 | 修改方法 | 说明 |
+|------|------|------|----------|------|
+| 11:29 | `agents/prompts.py` | `GLOBAL_VERIFY_PROMPT` | 新增步骤 2.5 | 新增「假设审计」：当推理链出现矛盾时，列出所有隐含假设 → 逐一翻转 → 检查矛盾是否消失 → 奥卡姆剃刀选最简解释 → 警惕搜索死循环 |
+| 11:29 | `agents/prompts.py` | `GLOBAL_VERIFY_PROMPT` 输出格式 | 新增 | 新增 `## 假设审计` 输出区块，确保 LLM 实际产出审计内容 |
+| 11:29 | `agents/prompts.py` | `GLOBAL_VERIFY_PROMPT` 步骤 3 | 修改 | 增加提示：矛盾经假设审计消除后应判断为「充分」，不要继续搜索 |
+| 11:29 | `agents/prompts.py` | `DECOMPOSE_PLAN_PROMPT` 逆向推理 | 修改 | 新增多义解读提示：关键术语可能有多种合理解读，列出所有可能，不要过早锁死一种 |
+
+**设计要点**：
+- **解读固化的根因**：`GLOBAL_VERIFY_PROMPT` 只有「缺口分析」（搜索更多事实），没有「假设审计」（质疑自己的理解）。矛盾出现时 Agent 只会搜索，不会反思自己的解读
+- **假设审计四步法**：列出隐含假设 → 逐一翻转 → 检查矛盾是否消失 → 奥卡姆剃刀选最简解释
+- **搜索死循环检测**：连续两轮无法解决同一矛盾 → 问题极大概率在解读上
+- **逆向推理多义性**：在问题拆分阶段就识别歧义术语的多种解读，避免下游推理被单一解读锁死
+
+---
+
+### 2025-02-22 第十四次修改（LLM Function Calling 工具选择 — 移除过程式查询重构）
+
+**需求**：
+1. 移除硬编码的过程式查询重构逻辑（`_reformulate_query`、`_has_chinese`、`_execute_search`、`_extract_baike_entities`），改由 LLM 通过 function calling 自主选择搜索工具
+2. 所有搜索工具统一通过 `bind_tools` 绑定到 LLM，LLM 根据问题语言和内容动态选择合适的工具
+3. 移除 prompt 中的问题相关示例（如元胞自动机），替换为中性示例
+4. 更新 `DECOMPOSE_PLAN_PROMPT` 输出格式字段名（`子问题：`）
+
+| 时间 | 文件 | 位置 | 修改方法 | 说明 |
+|------|------|------|----------|------|
+| 01:03 | `graph/nodes.py` | imports | 修改 | 新增 `RESEARCH_SEARCH_PROMPT` 导入 |
+| 01:03 | `graph/nodes.py` | `_execute_search` | 删除 | 移除过程式搜索分发（被 `bind_tools` 替代） |
+| 01:03 | `graph/nodes.py` | `_has_chinese` | 删除 | 移除中文检测（`tools/search.py` 中仍保留供 `auto_search` 使用） |
+| 01:03 | `graph/nodes.py` | `_reformulate_query` | 删除 | 移除引擎/查询格式校验（LLM 自主选择工具即隐式完成格式匹配） |
+| 01:03 | `graph/nodes.py` | `_extract_baike_entities` | 删除 | 移除正则解析百科实体（LLM 反思时通过 function calling 直接调用 `baike_search`） |
+| 01:03 | `graph/nodes.py` | `research_branch` 阶段1 | 重写 | `llm.bind_tools([bocha_search, serper_search, baike_search])` → LLM 选择工具 → 执行工具调用；fallback 到 `auto_search` |
+| 01:03 | `graph/nodes.py` | `research_branch` 阶段2 | 重写 | `llm.bind_tools([baike_search])` → LLM 反思时可选调用百科验证；`MAX_BAIKE_VERIFY` 限制调用次数 |
+| 01:03 | `graph/nodes.py` | `decompose_plan` 解析 | 修改 | 新增 `子问题：` 字段名支持（匹配更新后的 prompt 输出格式） |
+| 01:03 | `tools/search.py` | `bocha_search` docstring | 修改 | 示例从元胞自动机改为火影忍者（中性示例） |
+| 01:03 | `tools/search.py` | `ALL_SEARCH_TOOLS` | 修改 | 新增 `baike_search`（三工具列表供 `bind_tools` 使用） |
+
+**设计要点**：
+- **工具选择权交给 LLM**：`bind_tools` 让 LLM 根据 docstring 理解每个工具的适用场景，自主决定调用哪个（可多选）
+- **两阶段 function calling**：搜索阶段绑定三个工具，反思阶段只绑定 `baike_search`（约束验证范围）
+- **Fallback 机制**：LLM 未选择任何工具时降级到 `auto_search`（语言检测自动分发）
+- **移除的代码量**：约 80 行过程式逻辑 → 由 LLM 推理替代，提升灵活性和可维护性
+
+---
+
+### 2025-02-22 第十三次修改（搜索引擎格式校验 + 双向推理 + 证据稳定性）
+
+**需求**（来自日志观察）：
+1. 搜索引擎未使用正确格式的查询（中文查询发给serper、关键词片段发给bocha）
+2. 证据有时一开始对得上但后续被推翻（假设被当作确认事实）
+3. 不是所有问题需要正序解决——双向推理（正向+逆向）+ 渐进聚焦效果更好
+
+| 时间 | 文件 | 位置 | 修改方法 | 说明 |
+|------|------|------|----------|------|
+| 00:28 | `graph/nodes.py` | `decompose_plan` 解析 | 修改 | 清除 `**`/`#`/`` ` `` markdown 格式泄漏；支持新字段名 `搜索查询：`、`期望发现：`；去除引号包裹 |
+| 00:28 | `graph/nodes.py` | 新增 `_reformulate_query` | 新增 | 引擎/查询格式自动校验：中文→serper 降级为 bocha；纯英文→bocha 降级为 serper；长句→baike 降级为 bocha |
+| 00:28 | `graph/nodes.py` | `research_branch` | 修改 | 搜索前调用 `_reformulate_query` 校验格式 |
+| 00:28 | `graph/nodes.py` | `_extract_baike_entities` | 修改 | 去除编号前缀、markdown 格式、括号注释（修复 `1.  **米尔内站 (南极)**` 问题） |
+| 00:28 | `agents/prompts.py` | `DECOMPOSE_PLAN_PROMPT` | 重写 | 新增双向推理（正向+逆向）；聚焦分组（避免同一目标多个冗余查询）；`问题：`→`搜索查询：`；`目的：`→`期望发现：`；✅/❌ 格式示例；禁止 markdown 格式 |
+| 00:28 | `agents/prompts.py` | `RESEARCH_REFLECT_PROMPT` | 修改 | 新增步骤3「证据稳定性检验」：区分硬证据 vs 软假设；输出格式改为分别列出硬证据和软假设 |
+| 00:28 | `agents/prompts.py` | `RESEARCH_EVIDENCE_PROMPT` | 修改 | 强调严格区分确认事实和推测假设；推测部分必须标注；细化可靠性评估标准 |
+
+---
+
 ### 2025-02-21 第十二次修改（Send API 并行研究架构 — 完整重构）
 
 **需求**：现有顺序执行架构不够灵活，首轮覆盖不足时后续难以追赶（证据池膨胀）。需要：
@@ -555,14 +671,15 @@ def route_to_research(state):
 | GlobalVerify | 思维图(GoT) | 证据关联图 + 推理链完整性判断 |
 | GlobalSummary | 思维链(CoT) | 基于推理链线性推导答案 |
 
-### 6. 自动百科验证
-- `RESEARCH_REFLECT_PROMPT` 步骤5：LLM 输出「建议百科验证的实体」
-- `_extract_baike_entities()` 解析实体列表
-- `research_branch` 自动调用 `baike_search` 获取百科内容
-- 百科内容作为 `RESEARCH_EVIDENCE_PROMPT` 的 `baike_supplement` 输入
+### 6. LLM Function Calling 工具选择（v4.1）
+- **搜索阶段**：`llm.bind_tools([bocha_search, serper_search, baike_search])` — LLM 根据 docstring 自主选择工具（可多选）
+- **反思阶段**：`llm.bind_tools([baike_search])` — LLM 可选调用百科验证关键实体
+- **Fallback**：LLM 未选择任何工具时降级到 `auto_search`（语言检测自动分发）
+- 移除了过程式 `_reformulate_query`、`_execute_search`、`_extract_baike_entities`
+- 工具 docstring 是 LLM 选择依据，需保持清晰准确
 
-### 7. 搜索引擎查询格式
-- **博查**：完整中文自然语言句子（`"哪个开源硬件项目的灵感来源于元胞自动机？"`）
-- **Serper**：精准英文关键词组合（`"RepRap project von Neumann cellular automaton"`）
-- **百科**：单个实体名词（`"RepRap"` `"刘德华"`）
-- 在 `DECOMPOSE_PLAN_PROMPT` 中用 `引擎：` 属性指定，每个子问题只用一个引擎
+### 7. 搜索工具 docstring（LLM 选择依据）
+- **bocha_search**：`"搜索中文互联网内容（支持自然语言句子）...输入应为完整的中文自然语言句子"`
+- **serper_search**：`"搜索国际互联网内容（Google）...输入搜索查询字符串"`
+- **baike_search**：`"精确查询百度百科词条内容...输入应为准确的实体名称"`
+- LLM 根据问题语言和内容匹配最合适的工具，无需硬编码规则

@@ -60,6 +60,7 @@ class AgentState(TypedDict):
 
     # 循环控制
     loop_count: int
+    force_passed: bool               # 是否因达到 MAX_LOOPS 而强制通过
 
     # 输出
     final_answer: str

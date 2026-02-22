@@ -70,6 +70,7 @@ def run_question(question: str) -> str:
         "reasoning_chain": "",
         "is_sufficient": False,
         "loop_count": 0,
+        "force_passed": False,
         "final_answer": "",
         "formatted_answer": "",
     }

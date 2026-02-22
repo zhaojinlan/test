@@ -16,7 +16,7 @@ from config.settings import (
 from graph.state import AgentState, SubQuestion, Evidence
 from tools.search import bocha_search, serper_search, auto_search, fetch_url_content, baike_search
 from agents.prompts import (
-    DECOMPOSE_PLAN_PROMPT, RESEARCH_REFLECT_PROMPT,
+    DECOMPOSE_PLAN_PROMPT, RESEARCH_SEARCH_PROMPT, RESEARCH_REFLECT_PROMPT,
     RESEARCH_EVIDENCE_PROMPT, GLOBAL_VERIFY_PROMPT,
     GLOBAL_SUMMARY_PROMPT, FORMAT_ANSWER_PROMPT,
 )
@@ -64,6 +64,24 @@ def _completed_questions_summary(sub_questions: List[SubQuestion], completed_ids
     return "\n".join(lines)
 
 
+def _failed_queries_summary(sub_questions: List[SubQuestion], evidence_pool: list, completed_ids: list) -> str:
+    """构建已尝试搜索方向及其结果的摘要，帮助 DecomposePlan 避免重复"""
+    completed_set = set(completed_ids or [])
+    lines = []
+    for sq in sub_questions:
+        if sq["id"] in completed_set or sq["status"] == "done":
+            # 查找该子问题对应的证据
+            matching = [e for e in evidence_pool if e.get("source_question_id") == sq["id"]]
+            if matching:
+                e = matching[0]
+                result_brief = e["statement"][:150]
+                lines.append(f"  Q{sq['id']}: {sq['question']}")
+                lines.append(f"    → 结果({e['reliability']}): {result_brief}")
+            else:
+                lines.append(f"  Q{sq['id']}: {sq['question']} → 无结果")
+    return "\n".join(lines) if lines else "（暂无）"
+
+
 # 高价值页面 URL 模式（百科、维基等信息密集型页面）
 _HIGH_VALUE_URL_PATTERNS = [
     "baike.baidu.com",
@@ -94,37 +112,6 @@ def _deep_read_promising_urls(raw_results: str, max_reads: int = 2) -> str:
     return "\n\n".join(read_contents) if read_contents else ""
 
 
-def _execute_search(engine: str, query: str) -> str:
-    """执行搜索，返回格式化文本"""
-    for attempt in range(MAX_SEARCH_RETRIES):
-        try:
-            if engine == "baike":
-                return baike_search.invoke(query)
-            elif engine == "bocha":
-                return bocha_search.invoke(query)
-            elif engine == "serper":
-                return serper_search.invoke(query)
-            else:
-                return auto_search(query)
-        except Exception as e:
-            if attempt == MAX_SEARCH_RETRIES - 1:
-                return f"[搜索失败] {query}: {e}"
-    return f"[搜索失败] {query}: 重试耗尽"
-
-
-def _extract_baike_entities(reflection: str) -> list:
-    """从反思结果中提取建议百科验证的实体名称"""
-    entities = []
-    if "## 建议百科验证的实体" in reflection:
-        section = reflection.split("## 建议百科验证的实体")[1].strip()
-        # 取到下一个 ## 或末尾
-        if "##" in section:
-            section = section.split("##")[0].strip()
-        for line in section.split("\n"):
-            line = line.strip().strip("-").strip("•").strip()
-            if line and line != "无" and len(line) > 0 and len(line) < 30:
-                entities.append(line)
-    return entities[:2]
 
 
 # ==================== 节点 1：问题拆分和规划（ToT + 奥卡姆剃刀） ====================
@@ -150,10 +137,17 @@ def decompose_plan(state: AgentState) -> dict:
         if sq["id"] in completed_set and sq["status"] == "pending":
             sq["status"] = "done"
 
+    failed_queries = _failed_queries_summary(
+        state.get("sub_questions", []),
+        state.get("evidence_pool", []),
+        state.get("completed_question_ids", []),
+    )
+
     prompt = DECOMPOSE_PLAN_PROMPT.format(
         question=state["original_question"],
         existing_evidence=existing_evidence,
         completed_questions=completed_questions,
+        failed_queries=failed_queries,
     )
 
     response = llm.invoke([HumanMessage(content=prompt)])
@@ -196,10 +190,22 @@ def decompose_plan(state: AgentState) -> dict:
                 next_id += 1
 
             stripped = re.sub(r'^\d+[\.\)）、]\s*', '', line).strip()
-            if "问题：" in stripped or "问题:" in stripped:
+            if "搜索查询：" in stripped or "搜索查询:" in stripped:
+                current_q["question"] = stripped.split("搜索查询：")[-1].split("搜索查询:")[-1].strip()
+            elif "子问题：" in stripped or "子问题:" in stripped:
+                current_q["question"] = stripped.split("子问题：")[-1].split("子问题:")[-1].strip()
+            elif "问题：" in stripped or "问题:" in stripped:
                 current_q["question"] = stripped.split("问题：")[-1].split("问题:")[-1].strip()
             else:
                 current_q["question"] = stripped
+            # 清除 markdown 格式泄漏（LLM 常输出 **问题** 或 `查询`）
+            current_q["question"] = re.sub(r'^[\*\#\`\s]+', '', current_q["question"])
+            current_q["question"] = re.sub(r'[\*\#\`]+$', '', current_q["question"]).strip()
+            # 去除引号包裹（LLM 有时用引号包裹查询）
+            if current_q["question"].startswith('"') and current_q["question"].endswith('"'):
+                current_q["question"] = current_q["question"][1:-1].strip()
+            if current_q["question"].startswith('`') and current_q["question"].endswith('`'):
+                current_q["question"] = current_q["question"][1:-1].strip()
             current_q["engine"] = "both"
             current_q["priority"] = "中"
             current_q["purpose"] = ""
@@ -226,6 +232,8 @@ def decompose_plan(state: AgentState) -> dict:
 
         elif "目的：" in line or "目的:" in line:
             current_q["purpose"] = line.split("目的：")[-1].split("目的:")[-1].strip()
+        elif "期望发现：" in line or "期望发现:" in line:
+            current_q["purpose"] = line.split("期望发现：")[-1].split("期望发现:")[-1].strip()
 
     if current_q["question"]:
         new_questions.append(SubQuestion(
@@ -279,37 +287,70 @@ def decompose_plan(state: AgentState) -> dict:
 # ==================== 节点 2：研究分支（并行，由 Send API 调度） ====================
 
 def research_branch(state: AgentState) -> dict:
-    """研究分支节点 — 由 Send API 并行调度，完成搜索→反思→百科验证→证据提取全流程"""
+    """研究分支节点 — 由 Send API 并行调度，使用 LLM function calling 选择搜索工具"""
     sq = state.get("current_branch_question", {})
     if not sq:
         print(f"[ResearchBranch] 无子问题，跳过")
         return {"evidence_pool": [], "completed_question_ids": []}
 
     q_id = sq["id"]
-    engine = sq.get("search_engine", "both")
     query = sq["question"]
 
     print(f"\n[ResearchBranch] 处理 Q{q_id} [{sq.get('priority', '中')}]: {query}")
 
-    # ===== 阶段1：执行搜索 =====
-    if engine == "both":
-        print(f"  [Search] auto(both): {query}")
-        search_results = _execute_search("auto", query)
-    else:
-        print(f"  [Search] {engine}: {query}")
-        search_results = _execute_search(engine, query)
+    llm = _get_llm(temperature=0.1)
 
+    # ===== 阶段1：LLM 选择搜索工具并执行（Function Calling） =====
+    search_tools = [bocha_search, serper_search, baike_search]
+    tools_by_name = {t.name: t for t in search_tools}
+    llm_with_search = llm.bind_tools(search_tools)
+
+    search_prompt = RESEARCH_SEARCH_PROMPT.format(
+        sub_question=query,
+        purpose=sq.get("purpose", ""),
+        original_question=state["original_question"],
+    )
+
+    search_results_parts = []
+    for attempt in range(MAX_SEARCH_RETRIES):
+        try:
+            response = llm_with_search.invoke([HumanMessage(content=search_prompt)])
+            if response.tool_calls:
+                for tc in response.tool_calls:
+                    tool_name = tc["name"]
+                    tool_args = tc["args"]
+                    print(f"  [Search] LLM选择 {tool_name}({tool_args})")
+                    try:
+                        result = tools_by_name[tool_name].invoke(tool_args)
+                        search_results_parts.append(result)
+                    except Exception as e:
+                        print(f"  [Search] {tool_name} 执行失败: {e}")
+            else:
+                print(f"  [Search] LLM未选择工具，fallback到auto_search")
+                result = auto_search(query)
+                search_results_parts.append(result)
+            break
+        except Exception as e:
+            if attempt == MAX_SEARCH_RETRIES - 1:
+                print(f"  [Search] 重试耗尽: {e}")
+                search_results_parts.append(f"[搜索失败] {query}: {e}")
+
+    if not search_results_parts:
+        search_results_parts.append(auto_search(query))
+
+    search_results = "\n\n".join(search_results_parts)
     print(f"\n  [SearchResults]\n{search_results}\n")
 
-    # 深读高价值页面（baike 引擎已返回完整内容，跳过）
-    deep_content = "" if engine == "baike" else _deep_read_promising_urls(search_results, max_reads=2)
+    # 深读高价值页面（百科类已返回完整内容，跳过）
+    is_baike_only = all("百度百科" in p for p in search_results_parts)
+    deep_content = "" if is_baike_only else _deep_read_promising_urls(search_results, max_reads=2)
     if deep_content:
         search_results += "\n\n--- 以下为高价值页面的完整内容 ---\n\n" + deep_content
         print(f"\n  [DeepRead] 已补充 {deep_content.count('[URL内容]')} 个页面的完整内容\n")
 
-    # ===== 阶段2：LLM 反思 =====
-    llm = _get_llm(temperature=0.1)
+    # ===== 阶段2：LLM 反思 + 可选百科验证（Function Calling） =====
     evidence_text = _evidence_summary(state.get("evidence_pool", []))
+    llm_with_baike = llm.bind_tools([baike_search])
 
     reflect_prompt = RESEARCH_REFLECT_PROMPT.format(
         sub_question=query,
@@ -319,29 +360,29 @@ def research_branch(state: AgentState) -> dict:
         search_results=search_results[:12000],
     )
 
-    response = llm.invoke([HumanMessage(content=reflect_prompt)])
+    response = llm_with_baike.invoke([HumanMessage(content=reflect_prompt)])
     reflection = response.content.strip()
+
+    # 执行反思阶段的百科验证工具调用
+    baike_supplement = ""
+    if response.tool_calls:
+        baike_parts = []
+        for tc in response.tool_calls[:MAX_BAIKE_VERIFY]:
+            entity = tc["args"].get("entity", "")
+            print(f"  [BaikeVerify] LLM请求验证: {entity}")
+            try:
+                result = baike_search.invoke(tc["args"])
+                if "未找到" not in result and "查询异常" not in result:
+                    baike_parts.append(f"百度百科验证 [{entity}]:\n{result[:5000]}")
+            except Exception as e:
+                print(f"  [BaikeVerify] 失败: {e}")
+        if baike_parts:
+            baike_supplement = "\n\n--- 百度百科验证补充 ---\n\n" + "\n\n".join(baike_parts)
+            print(f"  [BaikeVerify] 已补充 {len(baike_parts)} 个实体的百科信息")
+
     print(f"[ResearchBranch] Q{q_id} 反思完成")
 
-    # ===== 阶段3：百科验证（自动触发） =====
-    baike_supplement = ""
-    if engine != "baike":
-        baike_entities = _extract_baike_entities(reflection)
-        if baike_entities:
-            baike_parts = []
-            for entity in baike_entities[:MAX_BAIKE_VERIFY]:
-                print(f"  [BaikeVerify] 验证实体: {entity}")
-                try:
-                    baike_result = baike_search.invoke(entity)
-                    if "未找到" not in baike_result and "查询异常" not in baike_result:
-                        baike_parts.append(f"百度百科验证 [{entity}]:\n{baike_result[:5000]}")
-                except Exception as e:
-                    print(f"  [BaikeVerify] 失败: {e}")
-            if baike_parts:
-                baike_supplement = "\n\n--- 百度百科验证补充 ---\n\n" + "\n\n".join(baike_parts)
-                print(f"  [BaikeVerify] 已补充 {len(baike_parts)} 个实体的百科信息")
-
-    # ===== 阶段4：证据提取 =====
+    # ===== 阶段3：证据提取 =====
     evidence_prompt = RESEARCH_EVIDENCE_PROMPT.format(
         sub_question=query,
         reflection=reflection[:6000],
@@ -446,7 +487,9 @@ def global_verify(state: AgentState) -> dict:
             best_answer = judgment.split("当前最佳答案：")[-1].split("当前最佳答案:")[-1].split("\n")[0].strip()
 
     # 循环次数达到上限，强制通过
+    force_passed = False
     if loop >= MAX_LOOPS:
+        force_passed = True
         is_sufficient = True
         print(f"[GlobalVerify] 达到最大循环次数 {MAX_LOOPS}，强制通过")
 
@@ -460,6 +503,7 @@ def global_verify(state: AgentState) -> dict:
         "reasoning_chain": reasoning_chain,
         "is_sufficient": is_sufficient,
         "loop_count": loop,
+        "force_passed": force_passed,
     }
 
     if best_answer:
@@ -490,17 +534,25 @@ def global_summary(state: AgentState) -> dict:
     response = llm.invoke([HumanMessage(content=prompt)])
     content = response.content.strip()
 
+    # 剥离 markdown 格式后提取答案
+    content_clean = content.replace("**", "").replace("*", "").replace("`", "")
+
     answer = ""
-    if "## 最终答案" in content:
-        answer = content.split("## 最终答案")[1].strip().split("\n")[0].strip()
-    elif "最终答案" in content:
-        answer = content.split("最终答案")[-1].strip().split("\n")[0].strip().lstrip("：:").strip()
+    if "## 最终答案" in content_clean:
+        answer = content_clean.split("## 最终答案")[1].strip().split("\n")[0].strip()
+    elif "最终答案" in content_clean:
+        answer = content_clean.split("最终答案")[-1].strip().split("\n")[0].strip().lstrip("：:").strip()
+
+    # 清理残余格式符号，检查是否有实质内容
+    answer = re.sub(r'^[\s\*\#\`：:]+', '', answer).strip()
+    answer = re.sub(r'[\s\*\#\`]+$', '', answer).strip()
 
     if not answer:
+        # fallback: 使用验证阶段的最佳答案
         answer = state.get("final_answer", "")
 
     if not answer:
-        for line in reversed(content.split("\n")):
+        for line in reversed(content_clean.split("\n")):
             line = line.strip()
             if line and len(line) > 3:
                 answer = line
