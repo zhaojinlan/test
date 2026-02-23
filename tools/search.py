@@ -114,8 +114,8 @@ def _format_results(raw: dict, query: str, engine: str) -> str:
 
 @tool
 def bocha_search(query: str) -> str:
-    """搜索中文互联网内容（支持自然语言句子）。适用于：中文问题、中国相关话题、中文百科/论坛/新闻。
-    输入应为完整的中文自然语言句子（如"火影忍者中第七班的成员有哪些？"），返回搜索结果摘要。"""
+    """搜索中文互联网内容。适用于：中文问题、中国相关话题、中文百科/论坛/新闻。
+    输入应为精准的中文关键词组合（如"火影忍者 第七班 成员"），而非完整自然语言句子。关键词之间用空格分隔。"""
     try:
         raw = _call_bocha(query)
         return _format_results(raw, query, "博查")

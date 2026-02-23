@@ -31,3 +31,5 @@ MAX_SEARCH_RETRIES = 2          # 单次搜索最大重试
 MAX_LOOPS = 4                   # 主循环最大次数（decompose→parallel_research→verify 算一轮）
 RECURSION_LIMIT = 100           # LangGraph 递归上限
 MAX_BAIKE_VERIFY = 2            # 每个研究分支最多触发的百科验证次数
+QUICK_CHECK_MIN_EVIDENCE = 2    # 触发快速充分性检查的最小证据数
+MAX_PARALLEL_WORKERS = 4        # 并行研究最大线程数

@@ -1,26 +1,31 @@
 # 多智能体推理系统 — 设计与变更记录
 
-## 架构概览（v4.0 Send API 并行研究架构）
+## 架构概览（v5.0 流式证据 + 动态剪枝架构）
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│                     主图（LangGraph + Send API）                    │
+│        主图（LangGraph + ThreadPool 流式证据 + 动态剪枝）         │
 │                                                                  │
 │  ┌──────────────┐                                                │
 │  │ DecomposePlan│   奥卡姆剃刀：只为缺口生成子问题                     │
 │  │  (ToT)       │                                                │
 │  └──────┬───────┘                                                │
-│         │ Send API（动态并行分支）                                    │
-│         ├──────────────────────────────────┐                     │
-│         ▼              ▼              ▼    │                     │
-│  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐               │
-│  │ Research     │ │ Research     │ │ Research     │  并行执行      │
-│  │ Branch Q1   │ │ Branch Q2   │ │ Branch Q3   │  (search →    │
-│  │ (CoT)       │ │ (CoT)       │ │ (CoT)       │   reflect →   │
-│  └──────┬──────┘ └──────┬──────┘ └──────┬──────┘   baike验证 → │
-│         │              │              │             证据提取)    │
-│         └──────────────┼──────────────┘                         │
-│                        ▼ 聚合                                    │
+│         │                                                          │
+│         ▼                                                          │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │          parallel_research 节点                         │    │
+│  │  ThreadPoolExecutor + as_completed                   │    │
+│  │                                                     │    │
+│  │  ┌─────────┐ ┌─────────┐ ┌─────────┐              │    │
+│  │  │ Branch  │ │ Branch  │ │ Branch  │  并行执行    │    │
+│  │  │  Q1     │ │  Q2     │ │  Q3     │  (子图)     │    │
+│  │  └────┬────┘ └────┬────┘ └────┬────┘              │    │
+│  │       │          │          │                    │    │
+│  │       ▼          ▼          │                    │    │
+│  │  流式返回证据 → QuickCheck  │ ← 仍在运行        │    │
+│  │  ✔ 充分 → 剪枝剩余分支 ───┘ ← 被剪枝(pruned)  │    │
+│  └─────────────────────────────────────────────────────┘    │
+│                        ▼                                           │
 │               ┌──────────────┐                                   │
 │    不充分      │ GlobalVerify │  推理链完整性判断                     │
 │  ┌────────────│  (GoT)       │  (充分/不充分，非刚性%)              │
@@ -34,18 +39,51 @@
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-**v3.1→v4.0 核心变化**：
-- 使用 LangGraph **Send API** 实现子问题**并行研究**（广度搜索）
-- 用**推理链完整性判断**取代刚性 80% 覆盖率阈值
-- 遵循**奥卡姆剃刀**：只为推理链缺口生成新子问题，不重复已覆盖内容
-- **自动百科验证**：研究分支发现实体后自动触发百度百科验证
-- **剪枝机制**：无效搜索方向标记为 pruned，不再重复
+### 架构图（与当前代码一致，推荐）
 
-**4个智能体节点**：
+#### 1) 主图（Supervisor Graph）
+
+```mermaid
+flowchart TB
+  A[decompose_plan\n(生成/补缺子问题)] --> PR[parallel_research\n(ThreadPool + 流式证据 + QuickCheck 剪枝)]
+
+  PR --> V[global_verify\n(推理链完整性评估)]
+
+  V --> C{route_after_verify\n充分? 或 loop>=MAX_LOOPS}
+  C -- 否 --> A
+  C -- 是 --> G[global_summary\n(生成 final_answer)]
+  G --> F[format_answer\n(生成 formatted_answer)]
+  F --> Z([END])
+```
+
+#### 2) 研究子图（Research Subgraph）
+
+```mermaid
+flowchart TB
+  RB_IN[[输入: original_question\n+ current_branch_question\n+ evidence_pool]] --> RS[search\n(动态 fan-out 并发)]
+  RS --> RR[reflect\n(反思 + 可选百科验证)]
+  RR --> RE[evidence\n(抽取 Evidence)]
+  RE --> RB_OUT[[输出: evidence_pool(增量)\n+ completed_question_ids]]
+
+  subgraph FANOUT[search 节点内部并发（示意）]
+    Q[LLM 生成 tool_calls\n(bocha/serper/baike 等)] --> P1[并发执行搜索工具]
+    P1 --> P2[选取候选 URL\n并发 deepread]
+  end
+```
+
+**v4.0→v5.0 核心变化**：
+- 用 **ThreadPoolExecutor + as_completed** 替代 Send API，消除"等待全部完成"瓶颈
+- **流式证据**：每个分支完成后立即返回证据，触发 **QuickCheck**（快速充分性检查）
+- **动态剪枝**：QuickCheck 判断充分后立即终止剩余分支，标记为 pruned
+- **优先级调度**：高优先级子问题优先提交到线程池
+- 保留 v4.0 所有能力：奥卡姆剃刀、自动百科验证、推理链完整性判断
+
+**5个图节点**：
 - **DecomposePlan (ToT)**：奥卡姆剃刀拆分，证据驱动缺口分析
-- **ResearchBranch (CoT)**：并行研究（搜索→反思→百科验证→证据提取）
+- **ParallelResearch**：线程池并行 + 流式证据 + QuickCheck 动态剪枝
 - **GlobalVerify (GoT)**：推理链完整性评估 + 剪枝建议
 - **GlobalSummary (CoT)**：基于推理链推导最终答案
+- **FormatAnswer (CoT)**：语义对齐 + 格式归一化
 
 **工具**：`bocha_search` + `serper_search` + `baike_search`（自动验证），LangChain `@tool`
 
@@ -53,13 +91,14 @@
 
 ```
 dataAgent/
-├── config/settings.py         # API密钥、模型、系统参数
+├── config/settings.py         # API密钥、模型、系统参数（含 QUICK_CHECK / MAX_PARALLEL_WORKERS）
 ├── tools/search.py            # 搜索工具 @tool（博查 + Serper + 百科）
-├── agents/prompts.py          # 6个提示词（ToT/CoT/GoT）
+├── agents/prompts.py          # 7个提示词（ToT/CoT/GoT + QUICK_CHECK_PROMPT）
 ├── graph/
-│   ├── state.py               # Evidence + SubQuestion + AgentState（Send API）
-│   ├── nodes.py               # 5个节点函数（含并行 research_branch）
-│   └── supervisor.py          # 图构建 + Send API 路由
+│   ├── state.py               # Evidence + SubQuestion + AgentState
+│   ├── nodes.py               # 4个节点函数 + quick_sufficiency_check 辅助
+│   ├── research_subgraph.py    # Research 子图（search→reflect→evidence + 内部并发）
+│   └── supervisor.py          # 图构建 + ThreadPool 流式证据 + 动态剪枝
 ├── utils/answer_formatter.py  # LLM 答案归一化
 ├── main.py                    # 入口
 └── requirements.txt
@@ -68,6 +107,357 @@ dataAgent/
 ---
 
 ## 变更记录
+
+### 2025-02-23 第二十三次修改（提示词层面消除 GlobalVerify 幻觉知识注入）
+
+**需求**（来自 submit_run_2_23.log id=1 推理链分析）：
+GlobalVerify 在构建推理链时，使用 LLM 自身训练数据知识（标注为"已知事实/外部知识/经查"）来填补证据池的缺口，导致：
+- 本应判断"不充分→触发下一轮搜索"的场景，被 LLM 用幻觉知识强行补全为"充分"
+- 幻觉知识一旦错误（如错误的期刊目录），整个推理链被污染，最终答案不可靠
+- 具体案例：id=1 中 GlobalVerify 凭知识"脑补"了 JLAS 4:1 的目录，跳过了对期刊归属的搜索验证
+
+**根因分析**：
+1. `GLOBAL_VERIFY_PROMPT` 的推理链构建部分未明确约束"只能基于证据池推理"，LLM 自然倾向于用自身知识填补缺口
+2. `GLOBAL_SUMMARY_PROMPT` 同样缺乏此约束
+3. `QUICK_CHECK_PROMPT` 在动态剪枝时也可能引入外部知识导致误判充分性
+
+**修改原则**：DecomposePlan 阶段允许用 LLM 知识生成假设（这是设计意图），但 GlobalVerify / GlobalSummary / QuickCheck 阶段必须严格基于证据池推理，不得引入外部知识
+
+| 时间 | 文件 | 位置 | 修改方法 | 说明 |
+|------|------|------|----------|------|
+| 03:30 | `agents/prompts.py` | `GLOBAL_VERIFY_PROMPT` §2 推理链构建 | 新增铁律段落 | 禁止引入证据池外信息（"已知事实""外部知识""经查""根据常识"），要求每步引用证据编号，缺口必须标记而非补全 |
+| 03:30 | `agents/prompts.py` | `GLOBAL_SUMMARY_PROMPT` 推理步骤末尾 | 新增铁律 | 同上约束：只能使用验证过的证据池信息推理 |
+| 03:30 | `agents/prompts.py` | `QUICK_CHECK_PROMPT` 判断标准 | 新增注意事项 | 只能基于证据池判断充分性，不得引入自身知识补充推理 |
+
+<!--
+#### 设计思路
+- DecomposePlan 是"假设生成器"，允许用 LLM 知识 → 生成候选假设 + 设计验证搜索
+- GlobalVerify / GlobalSummary 是"证据裁判官"，只能基于搜索到的证据做判断
+- 这种分工确保：知识用于引导搜索方向（高效），但不用于替代搜索结果（避免幻觉）
+-->
+
+### 2025-02-25 第二十二次修改（流式证据 + 动态剪枝架构 — 消除 Send API 等待全部完成瓶颈）
+
+**需求**（来自 submit_run_2_23.log 耗时分析）：
+Send API 架构存在“等待全部完成”瓶颈：当 4 个并行分支中 3 个在 60-80s 内完成但第 4 个需 180-200s 时，所有分支必须等待最慢的完成后才能进入 GlobalVerify。垄断时间浪费在等待而非推理。
+具体表现：
+- id=3：4 轮循环总耗时 1045s，每轮被最慢分支拖慢（最慢 Q6=182s）
+- id=4：4 轮循环总耗时 996s，最慢分支 Q12=200s
+- 多轮中大量分支产出 "low" 可靠性证据，且早期完成的分支证据可能已足以回答问题，但无法提前退出
+
+**根因分析**：
+1. **Send API 的等待全部完成语义**：LangGraph Send API 设计为“所有 Send 分支完成后才聚合”，无法在部分分支完成后提前评估充分性
+2. **缺乏轮内剪枝机制**：即使前 2 个分支的证据已足以回答问题，剩余分支仍然继续执行并消耗时间/API配额
+3. **无优先级调度**：所有子问题同等对待，低优先级探索性问题与高优先级验证性问题争抢同一时间窗口
+
+**架构重设计**：用 `ThreadPoolExecutor + as_completed` 替代 Send API，实现流式证据 + 动态剪枝
+
+| 时间 | 文件 | 位置 | 修改方法 | 说明 |
+|------|------|------|----------|------|
+| 00:00 | `config/settings.py` | L34-35 | 新增参数 | `QUICK_CHECK_MIN_EVIDENCE=2`（触发快速检查的最小证据数）、`MAX_PARALLEL_WORKERS=4`（线程池大小） |
+| 00:00 | `agents/prompts.py` | L358-374 | 新增 prompt | `QUICK_CHECK_PROMPT`：轻量级充分性检查，仅输出“充分/不充分”+ 答案，供动态剪枝决策 |
+| 00:00 | `graph/nodes.py` | 模块级 | 重构 | 移除死代码 `research_branch`（已被子图包装器替代）；新增 `quick_sufficiency_check()` 函数 |
+| 00:00 | `graph/supervisor.py` | 全文件 | **架构重写** | 移除 Send API + `route_to_research`；新增 `_run_single_branch()`（线程安全子图包装器）+ `parallel_research()`（核心节点：ThreadPoolExecutor + as_completed + QuickCheck + 剪枝）；图结构简化为 `decompose_plan → parallel_research → global_verify → ...` |
+| 00:00 | `Agent.md` | 架构图 + 变更记录 | 更新 | 更新架构图为 v5.0，新增变更记录 |
+
+<!--
+#### 核心设计详解
+
+##### 1. 从 Send API 到 ThreadPool 的架构转变
+旧架构（Send API）：
+```
+decompose_plan → Send("research_branch", state_1) + Send("research_branch", state_2) + ...
+                  ↓↓↓ 并行执行，但必须全部完成后才聚合 ↓↓↓
+                → global_verify
+```
+
+新架构（ThreadPool + 流式证据）：
+```
+decompose_plan → parallel_research(内部线程池)
+                  │
+                  ├─ Branch Q1 完成 → 证据流入 → QuickCheck → 不充分，继续
+                  ├─ Branch Q2 完成 → 证据流入 → QuickCheck → 充分！剪枝 Q3/Q4
+                  └─ (不等待 Q3/Q4)
+                → global_verify
+```
+
+核心优势：
+- 消除“等待全部完成”瓶颈：不再被最慢分支拖慢
+- 流式证据即时评估：每个分支完成后立即检查充分性
+- 动态剪枝省时省资源：充分后立即停止剩余分支
+- 优先级调度：高优先级子问题优先提交执行
+
+##### 2. QuickCheck 的设计权衡
+- 每次 QuickCheck 是一次 LLM 调用（~5-10s），在 4 个分支的场景下最多触发 3 次
+- 潜在开销：15-30s；潜在收益：避免 1 轮完整循环（200-400s）
+- 触发条件：证据数 >= QUICK_CHECK_MIN_EVIDENCE 且仍有未完成分支
+- 偏保设计：即使 QuickCheck 误判充分，后续 GlobalVerify 会做完整检查
+
+##### 3. 线程安全考虑
+- evidence_snapshot 是只读副本，各线程不修改
+- new_evidence 和 new_completed_ids 仅在主线程（as_completed 循环）中修改
+- stop_event 是 threading.Event，线程安全
+- executor.shutdown(wait=False, cancel_futures=True) 确保未启动的任务被取消
+
+##### 4. 与子图的关系
+- research_subgraph 保持不变，仍为 search→reflect→evidence 固定流程
+- 每个线程通过 _run_single_branch() 调用 subgraph.invoke()
+- 子图内部也用 ThreadPoolExecutor 做多引擎并发，嵌套线程在 Python 中安全
+-->
+
+---
+
+### 2025-02-24 第二十一次修改（重复派发修复 + 子图可观测性 + 控制台排版优化）
+
+**需求**（来自 submit_run_2_23.log 第3-4轮分析）：
+日志显示第3轮 Router 分派了 14 个并行研究分支（Q1-Q14），其中 Q1-Q11 早在前2轮已完成，被**重复派发**。根本原因：`completed_question_ids` 字段未定义在 `ResearchSubgraphState` 中，LangGraph 子图静默丢弃该字段 → 主图包装器 `out.get("completed_question_ids")` 始终返回 `[]` → 子问题永远不被标记完成。
+同时用户要求：在控制台可看到每次子图的内部结构（search→reflect→evidence 各阶段），并优化控制台打印排版。
+
+**根因分析**：
+1. **`ResearchSubgraphState` 缺少 `completed_question_ids` 字段**：`_extract_evidence` 返回 `{"completed_question_ids": [q_id]}`，但该字段不在子图 state schema 中 → LangGraph 静默丢弃 → `supervisor.py` 包装器 `out.get(...)` 得到 `[]` → `operator.add` 累积的 `completed_question_ids` 始终为空列表 → `decompose_plan` 和 `route_to_research` 中的状态更新逻辑形同虚设 → **每轮重复派发所有子问题**
+2. **无子图内部可观测性**：`research_subgraph.py` 的三个节点（search/reflect/evidence）无任何 print 输出 → 控制台仅能看到"处理 Q1"和"Q1 子图完成"，中间过程完全黑盒
+3. **`decompose_plan` 打印不区分已完成/待处理**：所有子问题按统一格式打印，难以快速判断实际新增了几个问题
+
+| 时间 | 文件 | 位置 | 修改方法 | 说明 |
+|------|------|------|----------|------|
+| 00:00 | `graph/research_subgraph.py` | `ResearchSubgraphState` | 新增字段 | 新增 `completed_question_ids: list`，确保子图 state schema 包含此字段，LangGraph 不再静默丢弃 |
+| 00:00 | `graph/supervisor.py` | `research_branch` 返回值 | BUG-FIX | 改为直接 `[q_id] if q_id != "?" else []`，不再依赖 `out.get("completed_question_ids")`（双重保险） |
+| 00:00 | `graph/supervisor.py` | `route_to_research` | 增强 | 新增 `completed_question_ids` 双重过滤：`sq["status"] == "pending" and sq["id"] not in completed_set`；打印增加总计/已完成统计 |
+| 00:00 | `graph/research_subgraph.py` | `_search_parallel` | 新增日志 | 添加 `[Q{id}/Search]` 前缀日志：LLM工具选择、搜索结果数、DeepRead 补充数 |
+| 00:00 | `graph/research_subgraph.py` | `_reflect` | 新增日志 | 添加 `[Q{id}/Reflect]`、`[Q{id}/BaikeVerify]` 日志：反思状态、百科验证实体及数量 |
+| 00:00 | `graph/research_subgraph.py` | `_extract_evidence` | 新增日志 | 添加 `[Q{id}/Evidence]` 日志：证据ID、可靠性、陈述摘要（≤80字） |
+| 00:00 | `graph/nodes.py` | `decompose_plan` 打印 | 重构 | 分组显示 done/pending/pruned，统计各状态数量；已完成问题截断60字，待处理问题完整显示 |
+| 00:00 | `graph/nodes.py` | `global_verify` 打印 | 增强 | 新增子问题完成率和证据池数量统计行 |
+
+<!--
+#### 核心知识点
+
+##### 1. LangGraph 子图 State Schema 的静默丢弃行为
+LangGraph 的 `StateGraph` 使用 `TypedDict` 定义 state schema。当节点返回的 dict 中包含 schema 未定义的 key 时，该 key 被**静默丢弃**（不报错、不警告）。这是 LangGraph 的设计行为而非 bug，但对开发者来说是一个危险的陷阱。
+
+本次 bug 的表现链：
+```
+_extract_evidence 返回 {"completed_question_ids": [q_id]}
+→ ResearchSubgraphState 无此字段
+→ LangGraph 静默丢弃
+→ subgraph.invoke() 输出无此 key
+→ supervisor 包装器 out.get("completed_question_ids", []) = []
+→ 主图 operator.add 累积空列表
+→ completed_question_ids 始终为 []
+→ decompose_plan 的状态更新 loop 永远不触发
+→ route_to_research 每轮重复派发所有子问题
+```
+
+**教训**：子图返回值的每个 key 都必须在子图 state schema 中声明。如果需要透传数据给主图，有两种方式：
+- 方式A：在子图 state schema 中声明字段（本次采用）
+- 方式B：在主图包装器中直接计算，不依赖子图输出（本次也做了，双重保险）
+
+##### 2. 并行分支的日志可读性
+Send API 并行执行的分支会交替输出日志。解决方案：所有子图内部日志使用 `[Q{id}/阶段]` 前缀，便于在混合输出中按 Q_id 过滤跟踪单个分支的完整流程。
+
+##### 3. 修复后的预期行为变化
+- 修复前：每轮派发所有子问题（Round1: 4个, Round2: 8个, Round3: 14个）→ API调用指数增长
+- 修复后：每轮仅派发新增子问题（Round1: 4个, Round2: ≤4个新增, Round3: ≤4个新增）→ API调用线性增长
+- 预期耗时降低 60-70%（消除重复搜索的时间和 API 消耗）
+-->
+
+---
+
+### 架构改进建议（待评估）
+
+| # | 方向 | 现状 | 建议 | 优先级 |
+|---|------|------|------|--------|
+| 1 | 并发分支上限 | 无上限（受 LLM 输出控制） | 在 `route_to_research` 中增加 `MAX_CONCURRENT_BRANCHES` 上限（建议 6），超出部分排队到下一轮 | 中 |
+| 2 | 证据池 token 预算 | 无限增长 | 为 `_evidence_summary` 增加 token 估算，超出阈值时按可靠性排序截断低价值证据 | 中 |
+| 3 | 证据 ID 碰撞 | `id = q_id * 10`，跨轮同 q_id 会覆盖 | 改用 `q_id * 100 + loop_count * 10` 或全局自增 ID | 低 |
+| 4 | 子图错误隔离 | 子图节点异常导致整个分支静默失败 | 在 supervisor 包装器中 try/catch，失败分支返回空证据 + 错误日志 | 中 |
+| 5 | 搜索结果去重 | 不同分支可能搜到相同 URL | 在 `global_verify` 中对 evidence_pool 按 source_urls 去重合并 | 低 |
+
+---
+
+### 2026-02-23 第二十次修改（Research 子图封装 + 动态并发 — 缩短单子问题耗时）
+
+**需求**（来自 run_log.txt 耗时过长分析）：
+当前 Send API 仅实现"子问题级并发"，但每个 ResearchBranch 内部仍是固定串行流程（search→deepread→reflect→baike→evidence），且 search 阶段对多个搜索引擎的调用是顺序执行，导致整体耗时过长。
+
+**设计原则**：把固定研究流程封装为可复用子图（Research Subgraph），主图 Send 并发分发子图实例；在子图内部对多引擎搜索与 DeepRead 做动态并发（按需 fan-out），减少单分支 wall time。
+
+| 时间 | 文件 | 位置 | 修改方法 | 说明 |
+|------|------|------|----------|------|
+| 00:05 | `graph/research_subgraph.py` | 全文件 | 重写（从占位模块变为可执行子图） | 新增 `compile_research_subgraph()`；子图节点：`search`（bocha/serper/baike 并发 + deepread 并发）→ `reflect`（LLM 反思 + 可选百科验证）→ `evidence`（LLM 证据提取） |
+| 00:07 | `graph/research_subgraph.py` | `search` 节点 | 增强 | `search` 阶段复用 `RESEARCH_SEARCH_PROMPT` + LLM tool-calling 生成查询，再将 tool_calls 并发执行（fallback 保留 engine 直连） |
+| 00:05 | `graph/supervisor.py` | research_branch 节点 | 重构 | 主图 `research_branch` 改为子图包装器：调用 `_RESEARCH_SUBGRAPH.invoke(...)` 并仅回传 `evidence_pool` + `completed_question_ids`，避免把大字段合并回主状态 |
+| 00:08 | `graph/supervisor.py` | research_branch 节点 | 增强 | 增加每个 Q 的子图耗时日志，便于在 run_log 中定位瓶颈 |
+| 00:35 | `Test/run_agent_submit.py` | `run_one_question` | 增强 | 批量脚本输出兼容：当 `formatted_answer` 为空时 fallback 到 `final_answer`，避免批量生成出现空答案 |
+
+<!--
+#### 知识点（便于 review）
+- Send API 并发粒度：当前主图并发的是 "pending 子问题"，即 Q 级并发；若单个 Q 内部 search/reflect/evidence 仍串行，则单 Q 的 wall time 仍然成为瓶颈
+- 动态并发（fan-out）：在子图内部根据 `search_engine` 决定并发调用数量（both=2个引擎，否则=1个）；DeepRead 对候选 URL 并发抓取
+- 性能与安全：网络 IO 为主的搜索/抓取非常适合线程并发；但子图输出应尽量小（只回传证据与完成标记），否则主状态合并成本会上升且 run_log 过长
+ - 批量生成兼容：`Test/run_agent_submit.py` 通过 `graph.supervisor.compile_graph().invoke()` 调用当前系统；输出字段优先 `formatted_answer`，为空则使用 `final_answer`
+-->
+
+### 2025-02-22 第十九次修改（假设驱动架构 — 从"搜索发现"转为"知识推理+验证搜索"）
+
+**需求**（来自 run_log.txt 同一推理过程的深层分析）：
+第十八次修改解决了搜索查询和答案格式问题，但同一 run_log 暴露了更根本的架构缺陷：系统完全不利用 LLM 自身知识，把所有推理外包给搜索引擎。
+具体表现：
+1. DecomposePlan 把原题条件拆分后加"查找"变成子问题（如"查找16世纪既是军事领袖又以笔名创作诗歌的统治者"），这是复述不是分解
+2. Q3/Q4/Q8 三个抽象描述性子问题全部返回"未获得有效信息"，浪费37.5%的搜索资源
+3. Q5 的 Google 结果明确包含"pen name Muhibbi"（6条结果），但证据提取输出"未获得有效信息"
+4. 整个推理耗时694秒、2轮8个子问题，而 LLM 自身知识足以在第一步就推断出候选实体
+
+**根因分析（2 项，均为架构级问题）**：
+1. **DECOMPOSE_PLAN_PROMPT 把 LLM 当"问题拆分器"而非"知识推理器"**：prompt 从未要求 LLM 先用自身知识推理候选实体，直接跳到"设计搜索"。导致子问题是原题的描述性复述，搜索引擎无法处理
+2. **RESEARCH_REFLECT/EVIDENCE_PROMPT 的信息丢失链**：多引擎结果（博查24条+Google9条）被截断为12000字符→大量无关博查结果占据字符预算→Google的关键结果被淹没→反思遗漏→证据提取默认输出"未获得有效信息"
+
+**设计原则**：从"搜索驱动"（search-to-discover）转为"假设驱动"（hypothesize-then-verify）。LLM 先用自身知识形成候选假设，搜索只做验证和补充
+
+| 时间 | 文件 | 位置 | 修改方法 | 说明 |
+|------|------|------|----------|------|
+| 23:17 | `agents/prompts.py` | `DECOMPOSE_PLAN_PROMPT` | 重写 | 新增"第一步：知识推理"（特征提取与候选推断→推理链构建→知识缺口识别）；"第二步"从"生成子问题"改为"设计验证性搜索"（验证类/探索类/补缺类）；新增禁止事项"禁止复述原题""禁止用描述性长句代替已知实体名" |
+| 23:17 | `agents/prompts.py` | `RESEARCH_REFLECT_PROMPT` 步骤1 | 修改 | "逐条扫描"改为"分来源扫描"：强调每个搜索引擎的结果必须分别检查，即使某引擎大多无关也不能跳过其他引擎的结果 |
+| 23:17 | `agents/prompts.py` | `RESEARCH_REFLECT_PROMPT` 步骤2 | 修改 | 新增强调"即使只有1条结果包含关键信息也必须提取" |
+| 23:17 | `agents/prompts.py` | `RESEARCH_EVIDENCE_PROMPT` 要求4 | 修改 | "未获得有效信息"从默认 fallback 改为"最后手段"：只有当反思结果中确实没有任何相关实体/事实时才可使用 |
+| 23:17 | `graph/nodes.py` | `decompose_plan` 解析 | 修改 | 兼容新输出格式"## 知识推理"（同时保留旧版"## 锚点分析"的兼容）；新增"验证目标"字段解析；日志标签改为"知识推理" |
+
+<!--
+#### 核心设计详解
+
+##### 1. 架构转变：搜索驱动 → 假设驱动
+旧架构（搜索驱动）：问题→拆分子问题→搜索→反思→推理
+- LLM 仅负责拆分和反思，不使用自身知识
+- 子问题 = 原题条件的描述性复述
+- 搜索引擎承担全部发现任务（但搜索引擎不做语义推理）
+
+新架构（假设驱动）：问题→LLM 知识推理→形成候选假设→设计验证搜索→确认/否定
+- LLM 先用自身知识推断候选实体（如"16世纪+笔名诗人+法典编纂"→苏莱曼一世）
+- 子问题 = "验证[具体实体名]+[待验证属性]"（如"验证苏莱曼一世以笔名Muhibbi创作诗歌"）
+- 搜索引擎只做验证和补充，不做从零发现
+
+预期效果（以同一题目为例）：
+- 旧：Q1="查找16世纪既是军事领袖又以笔名创作诗歌的统治者" → 博查返回拿破仑、曹操
+- 新：Q1="验证苏莱曼一世是否以笔名Muhibbi创作诗歌" → 搜索"苏莱曼一世 Muhibbi 笔名 诗歌" → 直接命中
+
+##### 2. 证据丢失修复
+问题链：博查24条无关结果（占大量字符）→ 12000字符截断 → Google关键结果被淹没
+修复策略：
+- 根本解决：假设驱动的子问题更精准 → 搜索结果更相关 → 无关噪声减少
+- 防御性修复：反思 prompt 要求分来源扫描 + 证据 prompt 收紧"未获得有效信息"逃逸条件
+-->
+
+---
+
+### 2025-02-22 第十八次修改（搜索查询构造 CoT + 答案语义对齐 CoT — 用推理步骤替代规则列表）
+
+**需求**（来自 run_log.txt 推理过程分析）：
+Agent 处理一个历史推理题（16世纪两位君主 → 共同宣称继承的古老文明），暴露两个问题：
+1. 博查搜索查询为完整自然语言句子（如"查找16世纪既是军事领袖又以笔名创作诗歌还主持过法典编纂工作的帝国统治者"），搜索引擎做关键词匹配而非语义理解，导致返回大量不相关结果（拿破仑、曹操等）
+2. 问题明确问"这个古老的**文明**是什么？"，但 FormatAnswer 输出"拜占庭帝国"（帝国≠文明），答案实体类型与问题期望不一致
+
+**根因分析（2 项，均为 prompt 架构问题）**：
+1. **`RESEARCH_SEARCH_PROMPT` 缺少查询构造推理**：prompt 本质是"工具路由器"（选哪个搜索引擎），没有引导 LLM 做"意图分解→关键词提取→查询组装"的推理过程。LLM 直接将自然语言子问题原文传给搜索工具，搜索引擎无法理解语义
+2. **`FORMAT_ANSWER_PROMPT` 缺少语义对齐推理**：prompt 本质是"文本清洗器"（去括号、去 Markdown），没有引导 LLM 做"分析问题期望什么→检查答案是否匹配"的推理过程。LLM 只做表面格式变换，不做问题-答案的语义层面对齐
+
+**设计原则**：两个 prompt 均从"规则列表"重构为"CoT 推理步骤"，用通用推理方法论替代特定场景的枚举式补丁
+
+| 时间 | 文件 | 位置 | 修改方法 | 说明 |
+|------|------|------|----------|------|
+| 22:50 | `agents/prompts.py` | `RESEARCH_SEARCH_PROMPT` | 重写为 CoT | 角色从"工具路由器"重构为"查询翻译器"；新增4步推理：意图分解→关键词提取→查询组装→工具匹配；核心原则：搜索引擎是倒排索引关键词匹配系统 |
+| 22:50 | `agents/prompts.py` | `FORMAT_ANSWER_PROMPT` | 重写为 CoT | 角色从"文本清洗器"重构为"语义对齐专家"；新增4步推理：问题意图分析→核心提取→语义对齐→格式归一化；关键步骤3"语义对齐"用通用原则（类型/语言/粒度对齐）替代枚举式类型列表 |
+| 22:50 | `tools/search.py` | `bocha_search` docstring | 修改 | "支持自然语言句子"→"输入精准中文关键词组合"；示例从完整句子改为关键词 |
+| 22:50 | `graph/nodes.py` | `format_answer` 节点 | 新增安全解析 | 新增 `_extract_final_answer()` 函数：CoT prompt 可能导致 LLM 泄漏推理过程，从多行输出中提取最终答案行 |
+
+<!--
+#### 核心设计详解
+
+##### 1. Prompt 架构问题：规则列表 vs CoT 推理步骤
+旧架构（规则列表）：给 LLM 一组 if-then 规则，LLM 机械执行
+- 问题：无法泛化到未列举的场景（如枚举了"文明/帝国/朝代"，遇到"战役/河流/理论"就失效）
+- 根因：规则是特定场景的补丁，不是通用方法论
+
+新架构（CoT 推理步骤）：引导 LLM 按步骤推理，每步基于通用原则
+- 优点：LLM 先分析场景（问题类型/搜索意图），再基于通用原则决策，自然泛化到所有场景
+- 关键：步骤中只描述"做什么判断"（分析问题期望的答案类型），不描述"具体答案是什么"（不列举文明/帝国/朝代）
+
+##### 2. RESEARCH_SEARCH_PROMPT：查询翻译器模型
+LLM 的角色是在两种能力之间架桥：
+- 语义理解（LLM 擅长）：理解"16世纪同时是军事领袖、诗人、法典编纂者的帝国统治者"指的是苏莱曼一世
+- 关键词匹配（搜索引擎擅长）：根据精准关键词"苏莱曼一世 笔名 诗人 法典"匹配到目标网页
+
+4步推理流程：
+1. 意图分解：寻找什么类型的信息？什么网页会包含答案？
+2. 关键词提取：核心实体 + 区分性属性，丢弃虚词和描述性从句
+3. 查询组装：2-5个关键词短查询，候选实体名+属性词
+4. 工具匹配：按语言和内容类型选择搜索工具
+
+##### 3. FORMAT_ANSWER_PROMPT：语义对齐模型
+格式化不是文本清洗，而是问题-答案语义对齐：
+1. 问题意图分析：期望什么类型/语言/粒度的答案？
+2. 核心提取：剥离推理过程和修饰文字
+3. 语义对齐（关键）：答案的实体类别是否匹配问题的语义期望？不匹配则转换
+4. 格式归一化：去除符号、统一格式
+
+"语义对齐"是通用原则——不管问题问的是"文明""战役""河流"还是"理论"，LLM 都能通过分析问题疑问焦点自动判断答案类型是否匹配，无需枚举。
+
+##### 4. 安全解析器 _extract_final_answer()
+CoT prompt 的副作用：LLM 可能输出推理步骤而非纯答案。
+解决方案：从多行输出中反向扫描，跳过以"步骤/###/分析"等开头的推理行，返回最后一个实质内容行。
+-->
+
+---
+
+### 2025-02-22 第十七次修改（条件核查清单 + 假设审计边界约束 + 反确认偏差 — 修复假设审计滥用导致的错误答案）
+
+**需求**（来自 id=29 推理失败分析）：
+Agent 处理一个英文问题（男歌手因与全球知名女歌手合作二重唱而成名，该女歌手官网正在推广纪录片，求纪录片中心人物的法语名字）。正确答案几乎肯定是 Céline Dion（法裔加拿大歌手，2024年纪录片"I Am: Celine Dion"），但系统在第2轮输出了"BLACKPINK"（韩国女子团体）。
+
+**根因分析（4 项）**：
+1. **假设审计被滥用为翻转硬性约束的工具**：第15次修改引入的假设审计机制本意是解决解读歧义（如"西海岸"的含义），但 GlobalVerify 将其用于翻转问题的明确陈述——把"female vocalist"(单数个人)翻转为"可以是女子团体"，把"a male singer became widely known after collaborating"翻转为"也许是文学性表述"。这完全违背了假设审计的设计初衷
+2. **GlobalVerify 过早判断"充分"**：BLACKPINK 完全不满足"male singer"条件，且"官网推广纪录片"条件未被验证，但 Verify 仍判定充分。原因是判断标准中缺乏对问题明确条件的逐一核查机制
+3. **DecomposePlan 确认偏差**：第1轮 Q3 返回 BLACKPINK 的 YouTube 订阅数据后，第2轮 DecomposePlan 将全部子问题集中在 BLACKPINK 上（Q5 专门查 BLACKPINK 官网），完全忽略了初始分析中已提到的 Céline Dion 等替代候选
+4. **交叉验证仅在 GlobalSummary 中**：第16次修改添加的交叉验证规则只在 GLOBAL_SUMMARY_PROMPT 中，但错误发生在更早的 GLOBAL_VERIFY_PROMPT 阶段（判断"充分"后直接进入 Summary，来不及纠错）
+
+| 时间 | 文件 | 位置 | 修改方法 | 说明 |
+|------|------|------|----------|------|
+| 21:21 | `agents/prompts.py` | `GLOBAL_VERIFY_PROMPT` 步骤2.1 | 新增 | 新增「条件核查清单」：从原始问题提取所有明确条件，对候选答案逐一标记 ✓/✗/?，任何 ✗ 则排除该候选 |
+| 21:21 | `agents/prompts.py` | `GLOBAL_VERIFY_PROMPT` 步骤2.5 | 重写 | 假设审计增加边界约束：严格区分「可翻转的解读性假设」vs「不可翻转的问题明确陈述」；绝对禁止翻转性别/单复数/代词/因果关系/实体类型等硬性约束 |
+| 21:21 | `agents/prompts.py` | `GLOBAL_VERIFY_PROMPT` 步骤3 | 修改 | "充分"标准增加：候选答案必须与所有明确条件不冲突；条件核查清单有任何 ✗ 则必须判为不充分 |
+| 21:21 | `agents/prompts.py` | `GLOBAL_VERIFY_PROMPT` 输出格式 | 修改 | 新增 `## 条件核查清单` 输出区块；`## 假设审计` 改为仅列出可翻转假设 |
+| 21:21 | `agents/prompts.py` | `DECOMPOSE_PLAN_PROMPT` 核心原则 | 新增规则7 | 多候选探索：当已有证据指向某候选但未完全验证时，至少保留1个子问题探索替代候选 |
+| 21:21 | `agents/prompts.py` | `DECOMPOSE_PLAN_PROMPT` 禁止事项 | 新增规则7 | 禁止将所有新子问题围绕单一未验证候选生成 |
+
+<!--
+#### 核心设计详解
+
+##### 1. 条件核查清单（GLOBAL_VERIFY_PROMPT 步骤2.1）
+在推理链构建后、假设审计前，强制 LLM 从原始问题提取所有明确条件并逐一核查。
+id=29 案例中，BLACKPINK 的核查清单应为：
+- ✗ "a male singer became widely known after collaborating on a duet with..." → BLACKPINK 无对应男歌手
+- ✓ "globally recognized female vocalist" → BLACKPINK 全球知名（但 vocalist 是单数个人，团体应标 ✗）
+- ✓ "official online platform linked from video-sharing channel" → blackpinkofficial.com 链接自 YouTube
+- ? "website promoting documentary about life and career" → 未验证
+由于存在 ✗，BLACKPINK 必须被排除，系统会继续搜索其他候选。
+
+##### 2. 假设审计边界约束（步骤2.5 重写）
+旧行为：假设审计可以翻转任何"隐含假设"，包括问题的明确陈述
+新行为：严格划分两类：
+- 可翻转（解读性假设）：术语理解方式，如"首个分部"可指总部或卫星办公室
+- 不可翻转（问题明确陈述）：性别、数量、代词、因果关系、实体类型等
+绝对禁止翻转不可翻转事实，堵住了 LLM 将 "female vocalist" → "female group" 的漏洞。
+
+##### 3. 反确认偏差（DECOMPOSE_PLAN_PROMPT 规则7）
+旧行为：Round 2 的 DecomposePlan 说"E30已指向BLACKPINK，这是一个强信号"→ 所有子问题围绕 BLACKPINK
+新行为：规则7 要求至少保留1个子问题探索替代候选 → 如果有1个子问题搜索"Céline Dion documentary official website French"，很可能直接找到正确答案
+
+##### 4. 假设审计的正确用途 vs 滥用
+正确用途（id=82 案例）：微软研究院"西海岸的首个分部"→ 翻转"分部≠总部"的解读 → 发现总部 Redmond 就在西海岸 → 矛盾消除
+滥用（id=29 案例）：问题明确说"female vocalist"(单数个人) → 翻转为"可以是女子团体" → 这不是解读歧义，而是违背问题的明确语义
+区分标准：术语的含义范围可以翻转（"分部"的外延），但语法上的硬性约束不可翻转（单数 vs 复数，个人 vs 团体）
+-->
+
+---
 
 ### 2025-02-22 第十六次修改（并行独立性 + 查询去重 + 多跳交叉验证 — 修复强制通过时的幻觉答案）
 
