@@ -62,6 +62,11 @@ class AgentState(TypedDict):
     loop_count: int
     force_passed: bool               # 是否因达到 MAX_LOOPS 而强制通过
 
+    # 实体预校验
+    precheck_passed: bool            # 预校验是否通过
+    precheck_count: int              # 预校验执行次数（防无限循环）
+    precheck_feedback: str           # 预校验失败时的反馈信息
+
     # 输出
     final_answer: str
     formatted_answer: str

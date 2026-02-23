@@ -10,9 +10,12 @@ from typing import List
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 from config.settings import (
     LLM_API_KEY, LLM_BASE_URL, LLM_MODEL_NAME,
     MAX_SEARCH_RETRIES, MAX_LOOPS, MAX_BAIKE_VERIFY,
+    MAX_PRECHECK_ENTITIES,
 )
 from graph.state import AgentState, SubQuestion, Evidence
 from tools.search import bocha_search, serper_search, auto_search, fetch_url_content, baike_search
@@ -20,7 +23,7 @@ from agents.prompts import (
     DECOMPOSE_PLAN_PROMPT, RESEARCH_SEARCH_PROMPT, RESEARCH_REFLECT_PROMPT,
     RESEARCH_EVIDENCE_PROMPT, GLOBAL_VERIFY_PROMPT,
     GLOBAL_SUMMARY_PROMPT, FORMAT_ANSWER_PROMPT,
-    QUICK_CHECK_PROMPT,
+    QUICK_CHECK_PROMPT, ENTITY_PRECHECK_PROMPT,
 )
 
 
@@ -116,6 +119,110 @@ def _deep_read_promising_urls(raw_results: str, max_reads: int = 2) -> str:
 
 
 
+# ==================== 节点 0.5：实体预校验（decompose后、research前） ====================
+
+def entity_precheck(state: AgentState) -> dict:
+    """实体预校验节点 — LLM function calling + 百科快速校验候选实体。
+
+    流程：
+    1. LLM（绑定 baike_search 工具）阅读知识推理，自行选择关键实体调用百科
+    2. 执行百科工具调用
+    3. LLM 判断百科信息是否推翻候选假设
+
+    仅在第一轮（loop_count=0）且首次（precheck_count=0）时执行。
+    """
+    precheck_count = state.get("precheck_count", 0)
+    loop_count = state.get("loop_count", 0)
+
+    # 非首轮 或 已校验过 → 自动放行
+    if loop_count > 0 or precheck_count > 0:
+        return {"precheck_passed": True, "precheck_count": precheck_count}
+
+    anchor = state.get("anchor_analysis", "")
+    if not anchor:
+        print(f"[EntityPrecheck] 无知识推理内容，自动放行")
+        return {"precheck_passed": True, "precheck_count": precheck_count + 1}
+
+    print(f"\n{'='*60}")
+    print(f"[EntityPrecheck] LLM 选择候选实体并查询百科...")
+    print(f"{'='*60}")
+
+    # Step 1: LLM function calling — 让 LLM 自己选要验证的实体
+    llm = _get_llm(temperature=0.0)
+    llm_with_baike = llm.bind_tools([baike_search])
+
+    pick_prompt = (
+        f"你是一位快速事实核查助手。阅读以下问题分析，从中识别最关键的1-{MAX_PRECHECK_ENTITIES}个"
+        f"候选实体（人名、机构名、地名等专有名词），并调用 baike_search 工具查询百科信息。\n\n"
+        f"原始问题：{state['original_question']}\n\n"
+        f"分析内容：\n{anchor[:4000]}\n\n"
+        f"要求：只对具体的专有名词调用 baike_search（如人名、机构名、地名），"
+        f"不要对描述性短语或抽象概念调用。"
+    )
+
+    try:
+        response = llm_with_baike.invoke([HumanMessage(content=pick_prompt)])
+    except Exception as e:
+        print(f"[EntityPrecheck] LLM异常: {e}，自动放行")
+        return {"precheck_passed": True, "precheck_count": precheck_count + 1}
+
+    # Step 2: 执行 LLM 选择的百科工具调用
+    if not getattr(response, "tool_calls", None):
+        print(f"[EntityPrecheck] LLM未选择任何实体验证，自动放行")
+        return {"precheck_passed": True, "precheck_count": precheck_count + 1}
+
+    baike_results = {}
+    for tc in response.tool_calls[:MAX_PRECHECK_ENTITIES]:
+        entity = tc["args"].get("entity", "")
+        print(f"  [EntityPrecheck] LLM选择验证: {entity}")
+        try:
+            result = baike_search.invoke(tc["args"])
+            if "未找到" not in result and "查询异常" not in result:
+                baike_results[entity] = result
+                print(f"  [EntityPrecheck] ✓ 百科命中: {entity}")
+            else:
+                print(f"  [EntityPrecheck] ✗ 百科未命中: {entity}")
+        except Exception:
+            print(f"  [EntityPrecheck] ✗ 百科查询失败: {entity}")
+
+    if not baike_results:
+        print(f"[EntityPrecheck] 所有实体百科未命中，自动放行")
+        return {"precheck_passed": True, "precheck_count": precheck_count + 1}
+
+    # Step 3: LLM 判断百科信息是否推翻假设
+    baike_text = "\n\n".join([f"[{e}]:\n{r[:2000]}" for e, r in baike_results.items()])
+
+    judge_prompt = ENTITY_PRECHECK_PROMPT.format(
+        question=state["original_question"],
+        candidates_analysis=anchor[:3000],
+        baike_info=baike_text[:5000],
+    )
+
+    try:
+        response = llm.invoke([HumanMessage(content=judge_prompt)])
+        content = response.content.strip()
+
+        passed = "通过" in content and "不通过" not in content
+        feedback = ""
+        if not passed:
+            if "反馈：" in content or "反馈:" in content:
+                feedback = content.split("反馈：")[-1].split("反馈:")[-1].strip()
+            feedback += f"\n\n百科参考信息：\n{baike_text[:3000]}"
+
+        print(f"[EntityPrecheck] 判断: {'通过 ✓' if passed else '不通过 ✗'}")
+        if not passed:
+            print(f"[EntityPrecheck] 反馈: {feedback[:200]}")
+
+        return {
+            "precheck_passed": passed,
+            "precheck_count": precheck_count + 1,
+            "precheck_feedback": feedback if not passed else "",
+        }
+    except Exception as e:
+        print(f"[EntityPrecheck] LLM异常: {e}，自动放行")
+        return {"precheck_passed": True, "precheck_count": precheck_count + 1}
+
+
 # ==================== 节点 1：问题拆分和规划（ToT + 奥卡姆剃刀） ====================
 
 def decompose_plan(state: AgentState) -> dict:
@@ -152,6 +259,13 @@ def decompose_plan(state: AgentState) -> dict:
         failed_queries=failed_queries,
     )
 
+    # 如果实体预校验失败，将反馈注入 prompt
+    precheck_fb = state.get("precheck_feedback", "")
+    if precheck_fb:
+        prompt += (f"\n\n## 实体预校验反馈（重要！你之前提出的候选实体被百科信息推翻）\n"
+                   f"{precheck_fb}\n"
+                   f"请根据此反馈重新分析问题，调整候选假设和搜索策略。")
+
     response = llm.invoke([HumanMessage(content=prompt)])
     content = response.content.strip()
 
@@ -179,7 +293,7 @@ def decompose_plan(state: AgentState) -> dict:
         if not line:
             continue
 
-        if re.match(r'^\d+[\.\)）、]', line):
+        if re.match(r'^\d+[\.\.\)）、]', line):
             if current_q["question"]:
                 new_questions.append(SubQuestion(
                     id=next_id,
@@ -193,16 +307,18 @@ def decompose_plan(state: AgentState) -> dict:
                 ))
                 next_id += 1
 
-            stripped = re.sub(r'^\d+[\.\)）、]\s*', '', line).strip()
-            if "搜索查询：" in stripped or "搜索查询:" in stripped:
-                current_q["question"] = stripped.split("搜索查询：")[-1].split("搜索查询:")[-1].strip()
-            elif "子问题：" in stripped or "子问题:" in stripped:
-                current_q["question"] = stripped.split("子问题：")[-1].split("子问题:")[-1].strip()
-            elif "问题：" in stripped or "问题:" in stripped:
-                current_q["question"] = stripped.split("问题：")[-1].split("问题:")[-1].strip()
+            stripped = re.sub(r'^\d+[\.\.\)）、]\s*', '', line).strip()
+            # 先清除 markdown 格式（**子问题**：→ 子问题：），防止标签匹配失败
+            stripped_clean = re.sub(r'\*{1,2}', '', stripped).strip()
+            if "搜索查询：" in stripped_clean or "搜索查询:" in stripped_clean:
+                current_q["question"] = stripped_clean.split("搜索查询：")[-1].split("搜索查询:")[-1].strip()
+            elif "子问题：" in stripped_clean or "子问题:" in stripped_clean:
+                current_q["question"] = stripped_clean.split("子问题：")[-1].split("子问题:")[-1].strip()
+            elif "问题：" in stripped_clean or "问题:" in stripped_clean:
+                current_q["question"] = stripped_clean.split("问题：")[-1].split("问题:")[-1].strip()
             else:
-                current_q["question"] = stripped
-            # 清除 markdown 格式泄漏（LLM 常输出 **问题** 或 `查询`）
+                current_q["question"] = stripped_clean
+            # 清除残余 markdown 格式泄漏
             current_q["question"] = re.sub(r'^[\*\#\`\s]+', '', current_q["question"])
             current_q["question"] = re.sub(r'[\*\#\`]+$', '', current_q["question"]).strip()
             # 去除引号包裹（LLM 有时用引号包裹查询）

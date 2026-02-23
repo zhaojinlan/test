@@ -71,6 +71,9 @@ def run_question(question: str) -> str:
         "is_sufficient": False,
         "loop_count": 0,
         "force_passed": False,
+        "precheck_passed": True,
+        "precheck_count": 0,
+        "precheck_feedback": "",
         "final_answer": "",
         "formatted_answer": "",
     }

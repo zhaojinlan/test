@@ -33,3 +33,4 @@ RECURSION_LIMIT = 100           # LangGraph 递归上限
 MAX_BAIKE_VERIFY = 2            # 每个研究分支最多触发的百科验证次数
 QUICK_CHECK_MIN_EVIDENCE = 2    # 触发快速充分性检查的最小证据数
 MAX_PARALLEL_WORKERS = 4        # 并行研究最大线程数
+MAX_PRECHECK_ENTITIES = 3       # 实体预校验最多验证的候选实体数

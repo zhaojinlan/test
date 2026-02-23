@@ -14,7 +14,10 @@ from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 
-from agents.prompts import RESEARCH_SEARCH_PROMPT, RESEARCH_REFLECT_PROMPT, RESEARCH_EVIDENCE_PROMPT
+from agents.prompts import (
+    RESEARCH_SEARCH_PROMPT, RESEARCH_REFLECT_PROMPT, RESEARCH_EVIDENCE_PROMPT,
+    RESEARCH_REFLECT_EVIDENCE_PROMPT,
+)
 from config.settings import (
     LLM_API_KEY,
     LLM_BASE_URL,
@@ -161,15 +164,50 @@ def _search_parallel(state: ResearchSubgraphState) -> dict:
     return {"search_results": search_results}
 
 
-def _reflect(state: ResearchSubgraphState) -> dict:
+def _parse_evidence_from_content(content: str, q_id: int) -> tuple:
+    """从 LLM 输出中解析证据陈述和可靠性（共用解析逻辑）"""
+    statement = ""
+    reliability = "low"
+
+    if "证据陈述：" in content or "证据陈述:" in content:
+        statement = content.split("证据陈述：")[-1].split("证据陈述:")[-1].split("\n")[0].strip()
+    else:
+        for line in content.split("\n"):
+            line = line.strip()
+            if line and len(line) > 5 and "可靠性" not in line and not line.startswith("#"):
+                statement = line
+                break
+
+    if "可靠性：" in content or "可靠性:" in content:
+        rel_text = content.split("可靠性：")[-1].split("可靠性:")[-1].strip().split("\n")[0].lower()
+        if "high" in rel_text or "高" in rel_text:
+            reliability = "high"
+        elif "medium" in rel_text or "中" in rel_text:
+            reliability = "medium"
+
+    if not statement:
+        statement = f"关于Q{q_id}的搜索未获得有效信息"
+
+    return statement, reliability
+
+
+def _reflect_and_extract(state: ResearchSubgraphState) -> dict:
+    """合并版反思+证据提取 — 减少一次 LLM 调用。
+
+    流程：
+    1. 用合并 prompt 调用 LLM（绑定 baike 工具）
+    2. 若 LLM 触发 baike → 执行百科查询 → 用 EVIDENCE_PROMPT 做第二次 LLM 调用整合
+    3. 若未触发 baike → 直接从合并输出中解析证据（省掉第二次 LLM 调用）
+    """
     sq = state.get("current_branch_question", {})
-    q_id = sq.get("id", "?")
+    q_id = int(sq.get("id", 0) or 0)
     query = sq.get("question", "")
     print(f"  [Q{q_id}/Reflect] 开始反思...")
+
     llm = _get_llm(temperature=0.1)
     llm_with_baike = llm.bind_tools([baike_search])
 
-    reflect_prompt = RESEARCH_REFLECT_PROMPT.format(
+    combined_prompt = RESEARCH_REFLECT_EVIDENCE_PROMPT.format(
         sub_question=query,
         purpose=sq.get("purpose", ""),
         original_question=state.get("original_question", ""),
@@ -177,9 +215,10 @@ def _reflect(state: ResearchSubgraphState) -> dict:
         search_results=(state.get("search_results", "") or "")[:12000],
     )
 
-    response = llm_with_baike.invoke([HumanMessage(content=reflect_prompt)])
+    response = llm_with_baike.invoke([HumanMessage(content=combined_prompt)])
     reflection = response.content.strip()
 
+    # 检查是否触发百科验证
     baike_supplement = ""
     if getattr(response, "tool_calls", None):
         baike_parts = []
@@ -195,52 +234,25 @@ def _reflect(state: ResearchSubgraphState) -> dict:
         if baike_parts:
             baike_supplement = "\n\n--- 百度百科验证补充 ---\n\n" + "\n\n".join(baike_parts)
             print(f"  [Q{q_id}/BaikeVerify] 补充 {len(baike_parts)} 个实体的百科信息")
+
+        # baike 触发时，需要第二次 LLM 调用整合百科信息到证据
+        print(f"  [Q{q_id}/Evidence] 提取证据（整合百科）...")
+        evidence_prompt = RESEARCH_EVIDENCE_PROMPT.format(
+            sub_question=query,
+            reflection=reflection[:6000],
+            baike_supplement=baike_supplement[:4000],
+        )
+        evidence_response = llm.invoke([HumanMessage(content=evidence_prompt)])
+        evidence_content = evidence_response.content.strip()
     else:
         print(f"  [Q{q_id}/Reflect] 反思完成，未触发百科验证")
+        # 无 baike → 直接从合并输出中解析证据（省掉一次 LLM 调用）
+        evidence_content = reflection
 
-    return {"reflection": reflection, "baike_supplement": baike_supplement}
-
-
-def _extract_evidence(state: ResearchSubgraphState) -> dict:
-    sq = state.get("current_branch_question", {})
-    q_id = int(sq.get("id", 0) or 0)
-    query = sq.get("question", "")
-    print(f"  [Q{q_id}/Evidence] 提取证据...")
-
-    llm = _get_llm(temperature=0.1)
-    evidence_prompt = RESEARCH_EVIDENCE_PROMPT.format(
-        sub_question=query,
-        reflection=(state.get("reflection", "") or "")[:6000],
-        baike_supplement=(state.get("baike_supplement", "") or "")[:4000],
-    )
-
-    response = llm.invoke([HumanMessage(content=evidence_prompt)])
-    content = response.content.strip()
-
-    statement = ""
-    reliability = "low"
-
-    if "证据陈述：" in content or "证据陈述:" in content:
-        statement = content.split("证据陈述：")[-1].split("证据陈述:")[-1].split("\n")[0].strip()
-    else:
-        for line in content.split("\n"):
-            line = line.strip()
-            if line and len(line) > 5 and "可靠性" not in line:
-                statement = line
-                break
-
-    if "可靠性：" in content or "可靠性:" in content:
-        rel_text = content.split("可靠性：")[-1].split("可靠性:")[-1].strip().split("\n")[0].lower()
-        if "high" in rel_text or "高" in rel_text:
-            reliability = "high"
-        elif "medium" in rel_text or "中" in rel_text:
-            reliability = "medium"
-
-    if not statement:
-        statement = f"关于Q{q_id}的搜索未获得有效信息"
+    # 解析证据
+    statement, reliability = _parse_evidence_from_content(evidence_content, q_id)
 
     source_urls = _extract_urls((state.get("search_results", "") or "")[:5000])[:3]
-
     new_evidence = Evidence(
         id=q_id * 10,
         source_question_id=q_id,
@@ -259,12 +271,10 @@ def _extract_evidence(state: ResearchSubgraphState) -> dict:
 def compile_research_subgraph():
     workflow = StateGraph(ResearchSubgraphState)
     workflow.add_node("search", _search_parallel)
-    workflow.add_node("reflect", _reflect)
-    workflow.add_node("evidence", _extract_evidence)
+    workflow.add_node("reflect_and_extract", _reflect_and_extract)
 
     workflow.set_entry_point("search")
-    workflow.add_edge("search", "reflect")
-    workflow.add_edge("reflect", "evidence")
-    workflow.add_edge("evidence", END)
+    workflow.add_edge("search", "reflect_and_extract")
+    workflow.add_edge("reflect_and_extract", END)
 
     return workflow.compile()

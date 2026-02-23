@@ -1,10 +1,10 @@
 # 多智能体推理系统 — 设计与变更记录
 
-## 架构概览（v5.0 流式证据 + 动态剪枝架构）
+## 架构概览（v6.0 实体预校验 + 反思证据合并架构）
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│        主图（LangGraph + ThreadPool 流式证据 + 动态剪枝）         │
+│     主图（LangGraph + 实体预校验 + ThreadPool 流式证据 + 动态剪枝）  │
 │                                                                  │
 │  ┌──────────────┐                                                │
 │  │ DecomposePlan│   奥卡姆剃刀：只为缺口生成子问题                     │
@@ -12,15 +12,18 @@
 │  └──────┬───────┘                                                │
 │         │                                                          │
 │         ▼                                                          │
+│  ┌──────────────┐                                                │
+│  │EntityPrecheck│  百科快速校验候选实体（仅首轮，≤15s）              │
+│  └──────┬───────┘                                                │
+│         │ 通过                     不通过 ↩ DecomposePlan          │
+│         ▼                          （附百科反馈）                   │
 │  ┌─────────────────────────────────────────────────────┐    │
 │  │          parallel_research 节点                         │    │
 │  │  ThreadPoolExecutor + as_completed                   │    │
-│  │                                                     │    │
 │  │  ┌─────────┐ ┌─────────┐ ┌─────────┐              │    │
 │  │  │ Branch  │ │ Branch  │ │ Branch  │  并行执行    │    │
 │  │  │  Q1     │ │  Q2     │ │  Q3     │  (子图)     │    │
 │  │  └────┬────┘ └────┬────┘ └────┬────┘              │    │
-│  │       │          │          │                    │    │
 │  │       ▼          ▼          │                    │    │
 │  │  流式返回证据 → QuickCheck  │ ← 仍在运行        │    │
 │  │  ✔ 充分 → 剪枝剩余分支 ───┘ ← 被剪枝(pruned)  │    │
@@ -45,14 +48,17 @@
 
 ```mermaid
 flowchart TB
-  A[decompose_plan\n(生成/补缺子问题)] --> PR[parallel_research\n(ThreadPool + 流式证据 + QuickCheck 剪枝)]
+  A[decompose_plan\n生成/补缺子问题] --> PC[entity_precheck\n百科快速校验候选实体]
+  PC --> C1{route_after_precheck\n通过?}
+  C1 -- 否 --> A
+  C1 -- 是 --> PR[parallel_research\nThreadPool+流式证据+QuickCheck剪枝]
 
-  PR --> V[global_verify\n(推理链完整性评估)]
+  PR --> V[global_verify\n推理链完整性评估]
 
-  V --> C{route_after_verify\n充分? 或 loop>=MAX_LOOPS}
-  C -- 否 --> A
-  C -- 是 --> G[global_summary\n(生成 final_answer)]
-  G --> F[format_answer\n(生成 formatted_answer)]
+  V --> C2{route_after_verify\n充分? 或 loop>=MAX_LOOPS}
+  C2 -- 否 --> A
+  C2 -- 是 --> G[global_summary\n生成final_answer]
+  G --> F[format_answer\n生成formatted_answer]
   F --> Z([END])
 ```
 
@@ -60,26 +66,25 @@ flowchart TB
 
 ```mermaid
 flowchart TB
-  RB_IN[[输入: original_question\n+ current_branch_question\n+ evidence_pool]] --> RS[search\n(动态 fan-out 并发)]
-  RS --> RR[reflect\n(反思 + 可选百科验证)]
-  RR --> RE[evidence\n(抽取 Evidence)]
-  RE --> RB_OUT[[输出: evidence_pool(增量)\n+ completed_question_ids]]
+  RB_IN[[输入: original_question\n+ current_branch_question\n+ evidence_pool]] --> RS[search\n动态fan-out并发]
+  RS --> RE[reflect_and_extract\n反思+可选百科验证+证据提取\n合并为单步]
+  RE --> RB_OUT[[输出: evidence_pool增量\n+ completed_question_ids]]
 
-  subgraph FANOUT[search 节点内部并发（示意）]
-    Q[LLM 生成 tool_calls\n(bocha/serper/baike 等)] --> P1[并发执行搜索工具]
-    P1 --> P2[选取候选 URL\n并发 deepread]
+  subgraph FANOUT[search 节点内部并发]
+    Q[LLM生成tool_calls] --> P1[并发执行搜索工具]
+    P1 --> P2[选取候选URL\n并发deepread]
   end
 ```
 
-**v4.0→v5.0 核心变化**：
-- 用 **ThreadPoolExecutor + as_completed** 替代 Send API，消除"等待全部完成"瓶颈
-- **流式证据**：每个分支完成后立即返回证据，触发 **QuickCheck**（快速充分性检查）
-- **动态剪枝**：QuickCheck 判断充分后立即终止剩余分支，标记为 pruned
-- **优先级调度**：高优先级子问题优先提交到线程池
-- 保留 v4.0 所有能力：奥卡姆剃刀、自动百科验证、推理链完整性判断
+**v5.0→v6.0 核心变化**：
+- 新增 **EntityPrecheck 节点**：在并行搜索前用百科快速校验候选实体，防止首步实体漂移
+- **合并 reflect+evidence**：研究子图从 3 节点缩减为 2 节点，无 baike 时省 1 次 LLM 调用
+- **修复子问题解析 bug**：`**子问题**：` markdown 格式泄漏到搜索查询中
+- 保留 v5.0 所有能力：流式证据、动态剪枝、优先级调度
 
-**5个图节点**：
+**6个图节点**：
 - **DecomposePlan (ToT)**：奥卡姆剃刀拆分，证据驱动缺口分析
+- **EntityPrecheck**：百科快速校验候选实体（仅首轮执行，≤15s）
 - **ParallelResearch**：线程池并行 + 流式证据 + QuickCheck 动态剪枝
 - **GlobalVerify (GoT)**：推理链完整性评估 + 剪枝建议
 - **GlobalSummary (CoT)**：基于推理链推导最终答案
@@ -91,14 +96,14 @@ flowchart TB
 
 ```
 dataAgent/
-├── config/settings.py         # API密钥、模型、系统参数（含 QUICK_CHECK / MAX_PARALLEL_WORKERS）
+├── config/settings.py         # API密钥、模型、系统参数（含 QUICK_CHECK / MAX_PARALLEL / PRECHECK）
 ├── tools/search.py            # 搜索工具 @tool（博查 + Serper + 百科）
-├── agents/prompts.py          # 7个提示词（ToT/CoT/GoT + QUICK_CHECK_PROMPT）
+├── agents/prompts.py          # 9个提示词（含 ENTITY_PRECHECK / REFLECT_EVIDENCE 合并版）
 ├── graph/
-│   ├── state.py               # Evidence + SubQuestion + AgentState
-│   ├── nodes.py               # 4个节点函数 + quick_sufficiency_check 辅助
-│   ├── research_subgraph.py    # Research 子图（search→reflect→evidence + 内部并发）
-│   └── supervisor.py          # 图构建 + ThreadPool 流式证据 + 动态剪枝
+│   ├── state.py               # Evidence + SubQuestion + AgentState（含 precheck 字段）
+│   ├── nodes.py               # 5个节点函数 + entity_precheck + quick_sufficiency_check
+│   ├── research_subgraph.py    # Research 子图（search → reflect_and_extract，2节点）
+│   └── supervisor.py          # 图构建 + entity_precheck 路由 + 流式证据 + 动态剪枝
 ├── utils/answer_formatter.py  # LLM 答案归一化
 ├── main.py                    # 入口
 └── requirements.txt
@@ -107,6 +112,55 @@ dataAgent/
 ---
 
 ## 变更记录
+
+### 2026-02-23 第二十四次修改（实体预校验 + 反思证据合并 + 子问题解析修复）
+
+**需求**（来自 submit_run_2_23.log 分析）：
+1. **首步实体漂移**：DecomposePlan 在第一步给出的候选实体可能与真实答案相差很远，导致后续所有搜索偏离方向。到 4 轮强制输出时答案仍错误（id=3,4,5,6 均耗时 585-662s）
+2. **研究子图 LLM 调用冗余**：search→reflect→evidence 3 步串行，当不触发百科验证时 evidence 步可省略
+3. **子问题解析 bug**：LLM 输出 `**子问题**：` 格式，markdown `**` 未被清除导致标签匹配失败，查询中携带 `子问题**：` 前缀
+
+**根因分析**：
+1. DecomposePlan 用 LLM 知识生成候选假设（设计意图），但无校验机制。一旦假设错误，后续搜索全部基于错误实体展开，浪费 3-4 轮循环（每轮 ~150s）
+2. 研究子图 reflect 和 evidence 是独立的 LLM 调用，但 evidence 本质只是从 reflect 输出中提取一句话摘要 + 可靠性标签，无 baike 时可合并
+3. 子问题解析时先用 `stripped` 变量匹配 `子问题：` 标签，但 LLM 输出的 `**子问题**：` 中 `**` 未预先清除，导致 `子问题：` 匹配失败，整行作为查询
+
+| 时间 | 文件 | 位置 | 修改方法 | 说明 |
+|------|------|------|----------|------|
+| 15:35 | `config/settings.py` | 系统参数区 | 新增常量 | `MAX_PRECHECK_ENTITIES=3`（实体预校验最多验证候选数） |
+| 15:35 | `graph/state.py` | `AgentState` | 新增 3 个字段 | `precheck_passed` / `precheck_count` / `precheck_feedback` |
+| 15:35 | `agents/prompts.py` | 新增两个 prompt | 新增 | `ENTITY_PRECHECK_PROMPT`（百科校验判断）、`RESEARCH_REFLECT_EVIDENCE_PROMPT`（合并版反思+证据） |
+| 15:35 | `graph/nodes.py` | 新增函数 | 新增 | `_extract_candidate_entities()`：从知识推理中提取 `**实体**` 格式的候选实体 |
+| 15:35 | `graph/nodes.py` | 新增函数 | 新增 | `entity_precheck()`：并行百科查询 + 轻量 LLM 判断百科是否推翻假设，仅首轮执行 |
+| 15:35 | `graph/nodes.py` | `decompose_plan()` | 修改 | 注入 `precheck_feedback` 到 prompt，使重规划时参考百科反馈 |
+| 15:35 | `graph/nodes.py` | 子问题解析循环 | 修复 | 在标签匹配前先 `re.sub(r'\*{1,2}', '', stripped)` 清除 markdown |
+| 15:35 | `graph/research_subgraph.py` | 整体重构 | 合并 | `_reflect` + `_extract_evidence` → `_reflect_and_extract`（无 baike 时 1 次 LLM，有 baike 时 2 次） |
+| 15:35 | `graph/supervisor.py` | 图构建 | 新增节点+路由 | `entity_precheck` 节点 + `route_after_precheck` 条件路由 |
+| 15:35 | `main.py` / `run_agent_submit.py` | 初始状态 | 新增字段 | `precheck_passed=True, precheck_count=0, precheck_feedback=""` |
+
+<!--
+#### 设计要点
+
+**实体预校验（EntityPrecheck）**：
+- 从 anchor_analysis 中用正则提取 `**粗体实体**`，过滤常见非实体粗体（置信度、推理依据等）
+- 对 top-3 候选并行调用 baike_search（~3-5s），收集百科信息
+- 用轻量 LLM 判断百科是否**明确推翻**假设（保守策略：信息不足=通过，仅矛盾=不通过）
+- 不通过时将百科原文+反馈注入 decompose_plan 的 prompt，引导重新分析
+- 仅首轮（loop_count=0 且 precheck_count=0）执行，后续轮次自动放行
+- 预期收益：对失败案例（4轮强制输出）节省 1-3 轮无效搜索 = 150-450s
+
+**反思+证据合并（reflect_and_extract）**：
+- 合并 prompt 同时要求输出反思分析 + 证据总结
+- 无 baike 触发时直接从合并输出解析证据（省 1 次 LLM 调用，~10s/分支）
+- 有 baike 触发时仍用 RESEARCH_EVIDENCE_PROMPT 做第二次调用整合百科信息
+- 研究子图从 3 节点（search→reflect→evidence）缩减为 2 节点（search→reflect_and_extract）
+- 预期收益：每轮 3-4 分支 × 50% 无 baike × 10s = 15-20s/轮
+
+**子问题解析修复**：
+- 根因：LLM 输出 `1. **子问题**：query text` → strip 数字后得到 `**子问题**：query text` → 匹配 `子问题：` 失败
+- 修复：在标签匹配前新增 `stripped_clean = re.sub(r'\*{1,2}', '', stripped).strip()` 清除所有 `*`
+- 效果：`**子问题**：query text` → `子问题：query text` → 正确匹配并提取 `query text`
+-->
 
 ### 2025-02-23 第二十三次修改（提示词层面消除 GlobalVerify 幻觉知识注入）
 

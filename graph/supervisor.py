@@ -30,6 +30,7 @@ from graph.state import AgentState
 from graph.research_subgraph import compile_research_subgraph
 from graph.nodes import (
     decompose_plan,
+    entity_precheck,
     global_verify, global_summary, format_answer,
     quick_sufficiency_check,
 )
@@ -184,6 +185,13 @@ def parallel_research(state: AgentState) -> dict:
 
 # ==================== 路由函数 ====================
 
+def route_after_precheck(state: AgentState) -> str:
+    """实体预校验后路由 — 通过则进入并行研究，不通过则回到规划"""
+    if state.get("precheck_passed", True):
+        return "parallel_research"
+    return "decompose_plan"
+
+
 def route_after_verify(state: AgentState) -> str:
     """全局验证后路由 — 基于推理链充分性"""
     # 推理链充分 → 全局总结
@@ -205,6 +213,7 @@ def build_graph() -> StateGraph:
     workflow = StateGraph(AgentState)
 
     workflow.add_node("decompose_plan", decompose_plan)
+    workflow.add_node("entity_precheck", entity_precheck)
     workflow.add_node("parallel_research", parallel_research)
     workflow.add_node("global_verify", global_verify)
     workflow.add_node("global_summary", global_summary)
@@ -212,8 +221,16 @@ def build_graph() -> StateGraph:
 
     workflow.set_entry_point("decompose_plan")
 
-    # decompose_plan → parallel_research（内部处理无 pending 情况）
-    workflow.add_edge("decompose_plan", "parallel_research")
+    # decompose_plan → entity_precheck → 条件路由
+    workflow.add_edge("decompose_plan", "entity_precheck")
+    workflow.add_conditional_edges(
+        "entity_precheck",
+        route_after_precheck,
+        {
+            "parallel_research": "parallel_research",
+            "decompose_plan": "decompose_plan",
+        },
+    )
 
     # parallel_research → global_verify
     workflow.add_edge("parallel_research", "global_verify")

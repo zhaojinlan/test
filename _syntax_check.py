@@ -51,8 +51,8 @@ with open(LOG, "w", encoding="utf-8") as f:
         all_ok = False
 
     try:
-        from graph.nodes import decompose_plan, research_branch, global_verify, global_summary, format_answer
-        f.write("[OK] graph.nodes: all 5 node functions imported\n")
+        from graph.nodes import decompose_plan, entity_precheck, global_verify, global_summary, format_answer, quick_sufficiency_check
+        f.write("[OK] graph.nodes: all 6 node functions imported\n")
     except Exception as e:
         f.write(f"[FAIL] graph.nodes: {e}\n")
         traceback.print_exc(file=f)
